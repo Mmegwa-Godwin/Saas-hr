@@ -1,0 +1,11 @@
+.env
+.smtp.env
+__pycache__/
+*.py[cod]
+saas_hr.db
+saas_hr.db-journal
+saas_hr.db-wal
+saas_hr.db-shm
+*.db*
+app.py.before_*
+security_audit_report.txt

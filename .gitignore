@@ -2,10 +2,12 @@
 .smtp.env
 __pycache__/
 *.py[cod]
+*.db*
 saas_hr.db
 saas_hr.db-journal
 saas_hr.db-wal
 saas_hr.db-shm
-*.db*
 app.py.before_*
 security_audit_report.txt
+test_email.py
+test_password_reset_email.py

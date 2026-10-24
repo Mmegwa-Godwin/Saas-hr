@@ -1,4 +1,5 @@
 import json
+import ssl
 import os, uuid, sqlite3, secrets, hashlib, smtplib
 from datetime import datetime, timedelta, timezone
 from math import radians, cos, sin, asin, sqrt
@@ -11,6 +12,7 @@ except ImportError:
 
 from flask import Flask, request, jsonify, g, render_template_string, session, abort
 from email.message import EmailMessage
+from urllib.parse import urlparse
 from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
@@ -1732,6 +1734,77 @@ def owner_approve_subscription(sid):
         "expires": expires
     })
 
+def get_password_reset_base_url():
+    configured = os.environ.get("SAAS_HR_BASE_URL", "").strip()
+
+    if not configured:
+        if IS_PRODUCTION:
+            raise RuntimeError(
+                "SAAS_HR_BASE_URL must be configured in production"
+            )
+        configured = "http://127.0.0.1:5000"
+
+    parsed = urlparse(configured)
+
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("SAAS_HR_BASE_URL is invalid")
+
+    if IS_PRODUCTION and parsed.scheme != "https":
+        raise RuntimeError(
+            "SAAS_HR_BASE_URL must use HTTPS in production"
+        )
+
+    return configured.rstrip("/")
+
+
+def send_password_reset_email(recipient, link):
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+    username = os.environ.get("SMTP_USERNAME", "").strip()
+    password = os.environ.get("SMTP_PASSWORD", "")
+    sender = os.environ.get("SMTP_FROM", username).strip()
+
+    if not host or not username or not password or not sender:
+        raise RuntimeError(
+            "SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM "
+            "must be configured"
+        )
+
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError:
+        raise RuntimeError("SMTP_PORT must be a valid port number") from None
+
+    if not 1 <= port <= 65535:
+        raise RuntimeError("SMTP_PORT is outside the valid range")
+
+    message = EmailMessage()
+    message["Subject"] = "Reset your SaaS-HR password"
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(
+        "We received a request to reset your SaaS-HR password.\n\n"
+        "Open the link below within 15 minutes to choose a new password:\n\n"
+        f"{link}\n\n"
+        "If you did not request this, you can ignore this email.\n"
+        "Do not share this link with anyone."
+    )
+
+    # Gmail submission uses STARTTLS. Never send credentials before TLS.
+    with smtplib.SMTP(host, port, timeout=15) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(username, password)
+        server.send_message(message)
+
+
 @app.route('/api/password/forgot', methods=['POST'])
 def password_recovery_request():
     data = request.get_json(silent=True) or {}
@@ -1766,9 +1839,10 @@ def password_recovery_request():
         return jsonify(generic), 200
 
     now = datetime.now(timezone.utc)
-    base_url = os.environ.get("SAAS_HR_BASE_URL", request.url_root.rstrip("/")).rstrip("/")
-
     try:
+        # Use a configured trusted URL, not the incoming Host header.
+        base_url = get_password_reset_base_url()
+
         for account_type, account_id, recipient in accounts:
             # Invalidate previous unused reset links for this account.
             db.execute(

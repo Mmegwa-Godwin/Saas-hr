@@ -11,7 +11,7 @@ app_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app_module)
 
 tmp = tempfile.TemporaryDirectory()
-app_module.DB = os.path.join(tmp.name, "test.db")
+app_module.app.config["DATABASE_PATH"] = os.path.join(tmp.name, "test.db")
 app_module.app.config["TESTING"] = True
 
 try:

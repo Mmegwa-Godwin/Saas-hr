@@ -472,7 +472,7 @@ try:
                VALUES (?, ?, ?, ?)""",
             (
                 "owner-test",
-                "owner@test.invalid",
+                "Owner@Test.invalid",
                 generate_password_hash("OwnerTestPassword!123"),
                 "2026-10-25"
             )

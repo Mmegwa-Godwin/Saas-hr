@@ -46,7 +46,7 @@ def authenticate_owner(email, password):
         return None
     db = get_db()
     admin = db.execute(
-        "SELECT id, email, password FROM platform_admins WHERE email=?",
+        "SELECT id, email, password FROM platform_admins WHERE lower(email)=?",
         (email,),
     ).fetchone()
     if not admin:

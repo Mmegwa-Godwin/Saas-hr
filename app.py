@@ -1315,6 +1315,7 @@ button{background:#111827;color:white;border:0;cursor:pointer}
 <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
 <button id="submit" type="submit">Sign in</button>
 </form>
+<p style="text-align:right;margin:8px 0"><a href="/forgot-password">Forgot password?</a></p>
 <p id="message" role="status" aria-live="polite"></p>
 </div>
 <script>

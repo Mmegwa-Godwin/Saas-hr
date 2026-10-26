@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: saas-hr
+    env: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FLASK_ENV
+        value: production
+      - key: SAAS_HR_SECRET_KEY
+        generateValue: true
+      - key: SAAS_HR_BASE_URL
+        value: https://saas-hr-1.onrender.com
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_PORT
+        value: "587"

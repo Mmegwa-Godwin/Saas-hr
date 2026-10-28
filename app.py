@@ -33,6 +33,29 @@ def haversine(lat1,lon1,lat2,lon2):
 @app.before_request
 def before(): init_db()
 
+
+def get_or_create_auth_version(account_type, account_id):
+    """Return the persistent session version for an authenticated account."""
+    db = get_db()
+    db.execute(
+        """
+        INSERT OR IGNORE INTO auth_versions
+            (account_type, account_id, version)
+        VALUES (?, ?, 1)
+        """,
+        (account_type, str(account_id)),
+    )
+    db.commit()
+    row = db.execute(
+        """
+        SELECT version FROM auth_versions
+        WHERE account_type=? AND account_id=?
+        """,
+        (account_type, str(account_id)),
+    ).fetchone()
+    return int(row["version"])
+
+
 @app.before_request
 def security_guard():
     path = request.path
@@ -49,6 +72,33 @@ def security_guard():
             or not secrets.compare_digest(expected_token, supplied_token)
         ):
             return jsonify({"error": "CSRF validation failed. Refresh the page and try again."}), 403
+
+    # A missing or outdated version invalidates legacy and revoked sessions.
+    identity = None
+    if session.get("platform_admin_id"):
+        identity = ("owner", session.get("platform_admin_id"))
+    elif session.get("employee_id"):
+        identity = ("employee", session.get("employee_id"))
+    elif session.get("company_id"):
+        identity = ("company", session.get("company_id"))
+
+    if identity:
+        account_type, account_id = identity
+        current = get_db().execute(
+            """
+            SELECT version FROM auth_versions
+            WHERE account_type=? AND account_id=?
+            """,
+            (account_type, str(account_id)),
+        ).fetchone()
+        session_version = session.get("auth_version")
+
+        if (
+            current is None
+            or type(session_version) is not int
+            or session_version != int(current["version"])
+        ):
+            session.clear()
 
     public_api = (
         '/api/csrf-token',
@@ -297,18 +347,231 @@ def install_browser_csrf_helper(response):
 """
 
     position = html.lower().find("</head>")
-    html = html[:position] + helper + html[position:]
+    if position >= 0:
+        html = html[:position] + helper + html[position:]
+
+    password_ui = r"""
+<style>
+.password-ui-wrap {
+    display:flex;
+    align-items:center;
+    width:100%;
+    gap:6px;
+}
+.password-ui-wrap input[type="password"],
+.password-ui-wrap input[type="text"] {
+    flex:1;
+    min-width:0;
+    width:0;
+    margin-right:0;
+}
+.password-eye {
+    flex:0 0 46px;
+    width:46px;
+    min-height:44px;
+    margin:0;
+    padding:8px;
+    border:1px solid #d1d5db;
+    border-radius:10px;
+    background:#f8fafc;
+    color:#111827;
+    cursor:pointer;
+    font-size:20px;
+}
+.password-strength {
+    margin:4px 0 12px;
+    font-size:13px;
+    line-height:1.6;
+}
+.password-strength-track {
+    height:7px;
+    margin:6px 0;
+    overflow:hidden;
+    background:#e5e7eb;
+    border-radius:10px;
+}
+.password-strength-fill {
+    height:100%;
+    width:0;
+    background:#dc2626;
+    transition:width .2s ease,background .2s ease;
+}
+.password-strength ul {
+    padding-left:20px;
+    margin-top:5px;
+}
+.password-strength .passed { color:#15803d; }
+.password-strength .missing { color:#6b7280; }
+</style>
+<script>
+(function () {
+    'use strict';
+
+    const rules = [
+        {label:'At least 12 characters', test:p=>p.length>=12},
+        {label:'One uppercase letter (A-Z)', test:p=>/[A-Z]/.test(p)},
+        {label:'One lowercase letter (a-z)', test:p=>/[a-z]/.test(p)},
+        {label:'One number (0-9)', test:p=>/[0-9]/.test(p)},
+        {label:'One special character (!@#$...)', test:p=>/[^A-Za-z0-9\s]/.test(p)}
+    ];
+
+    window.saasPasswordError = function (password) {
+        password = typeof password === 'string' ? password : '';
+        const missing = rules.filter(rule => !rule.test(password));
+        return missing.length
+            ? 'Strong password required. ' + missing.map(rule => rule.label).join('; ') + '.'
+            : '';
+    };
+
+    function initialisePasswordUI() {
+        document.querySelectorAll('input[type="password"]').forEach(function (input) {
+            if (input.dataset.passwordUiReady === '1') return;
+            input.dataset.passwordUiReady = '1';
+
+            const wrap = document.createElement('div');
+            wrap.className = 'password-ui-wrap';
+            input.parentNode.insertBefore(wrap, input);
+            wrap.appendChild(input);
+
+            const eye = document.createElement('button');
+            eye.type = 'button';
+            eye.className = 'password-eye';
+            eye.textContent = '👁';
+            eye.setAttribute('aria-label', 'Show password');
+            eye.setAttribute('aria-pressed', 'false');
+            eye.title = 'Show or hide password';
+            eye.addEventListener('click', function () {
+                const show = input.type === 'password';
+                input.type = show ? 'text' : 'password';
+                eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+                eye.setAttribute('aria-pressed', String(show));
+            });
+            wrap.appendChild(eye);
+
+            const needsStrength =
+                input.autocomplete === 'new-password' &&
+                input.id !== 'confirm';
+
+            if (!needsStrength) return;
+
+            input.minLength = 12;
+
+            const meter = document.createElement('div');
+            meter.className = 'password-strength';
+            meter.setAttribute('aria-live', 'polite');
+
+            const title = document.createElement('div');
+            title.textContent = 'Password strength: Not checked';
+
+            const track = document.createElement('div');
+            track.className = 'password-strength-track';
+            track.setAttribute('aria-hidden', 'true');
+
+            const fill = document.createElement('div');
+            fill.className = 'password-strength-fill';
+            track.appendChild(fill);
+
+            const list = document.createElement('ul');
+            const items = rules.map(function (rule) {
+                const item = document.createElement('li');
+                item.className = 'missing';
+                item.textContent = rule.label;
+                list.appendChild(item);
+                return item;
+            });
+
+            meter.append(title, track, list);
+            wrap.insertAdjacentElement('afterend', meter);
+
+            function updateStrength() {
+                const password = input.value;
+                const results = rules.map(rule => rule.test(password));
+                const score = results.filter(Boolean).length;
+
+                items.forEach(function (item, index) {
+                    item.className = results[index] ? 'passed' : 'missing';
+                    item.textContent = (results[index] ? '✓ ' : '○ ') + rules[index].label;
+                });
+
+                const label = !password ? 'Not checked'
+                    : score === 5 ? 'Strong'
+                    : score >= 4 ? 'Good — not yet strong'
+                    : score >= 3 ? 'Fair — needs improvement'
+                    : 'Weak';
+
+                title.textContent = 'Password strength: ' + label;
+                fill.style.width = (score * 20) + '%';
+                fill.style.background = score === 5 ? '#16a34a'
+                    : score >= 4 ? '#ca8a04' : '#dc2626';
+
+                input.dataset.passwordStrong = String(score === 5);
+            }
+
+            input.addEventListener('input', updateStrength);
+            updateStrength();
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initialisePasswordUI);
+    } else {
+        initialisePasswordUI();
+    }
+})();
+</script>
+"""
+
+    body_position = html.lower().rfind("</body>")
+    if body_position >= 0 and "password-ui-wrap" not in html:
+        html = html[:body_position] + password_ui + html[body_position:]
+
     response.set_data(html)
     return response
 
+def password_policy_error(password):
+    """Require strong passwords for newly created or reset accounts."""
+    if not isinstance(password, str):
+        return "Password must be text."
+    if len(password) < 12:
+        return "Use at least 12 characters."
+    if not any(c.isupper() for c in password):
+        return "Add at least one uppercase letter."
+    if not any(c.islower() for c in password):
+        return "Add at least one lowercase letter."
+    if not any(c.isdigit() for c in password):
+        return "Add at least one number."
+    if not any(not c.isalnum() and not c.isspace() for c in password):
+        return "Add at least one special character, such as ! or @."
+    return None
+
+
 @app.route('/api/company/register', methods=['POST'])
 def reg():
-    d=request.json; cid=uuid.uuid4().hex[:8]; db=get_db()
+    d = request.get_json(silent=True) or {}
+    name = str(d.get("name", "")).strip()
+    email = str(d.get("email", "")).strip().lower()
+    password = d.get("password", "")
+
+    if not name or not email:
+        return jsonify({"error": "Company name and email are required."}), 400
+
+    policy_error = password_policy_error(password)
+    if policy_error:
+        return jsonify({"error": policy_error}), 400
+
+    cid = uuid.uuid4().hex[:8]
+    db = get_db()
     try:
-        db.execute("INSERT INTO companies VALUES (?,?,?,?,?,?)",(cid,d['name'],d['email'],generate_password_hash(d['password']),'free',datetime.now().isoformat()))
+        db.execute(
+            "INSERT INTO companies VALUES (?,?,?,?,?,?)",
+            (cid, name, email, generate_password_hash(password),
+             "free", datetime.now().isoformat())
+        )
         db.commit()
-        return jsonify({"company_id":cid}),201
-    except: return jsonify({"error":"exists"}),400
+        return jsonify({"company_id": cid}), 201
+    except Exception:
+        db.rollback()
+        return jsonify({"error": "Registration failed. This email may already be registered."}), 400
 @app.route('/api/company/login', methods=['POST'])
 def login():
     d = request.get_json(silent=True) or {}
@@ -321,6 +584,7 @@ def login():
         session.clear()
         session['company_id'] = c['id']
         session['company_name'] = c['name']
+        session['auth_version'] = get_or_create_auth_version("company", c['id'])
         return jsonify({"company_id":c['id'],"name":c['name']})
     return jsonify({"error":"invalid"}),401
 @app.route('/api/employee/login', methods=['POST'])
@@ -346,6 +610,7 @@ def employee_login():
     session['employee_id'] = employee['id']
     session['employee_name'] = employee['name']
     session['employee_role'] = employee['role']
+    session['auth_version'] = get_or_create_auth_version("employee", employee['id'])
 
     return jsonify({
         "authenticated": True,
@@ -411,6 +676,193 @@ def check_session():
     })
 
 
+
+@app.route('/api/departments', methods=['GET', 'POST'])
+def company_departments():
+    cid = session.get("company_id")
+    if not cid:
+        return jsonify({"error": "Authentication required"}), 401
+
+    db = get_db()
+
+    if request.method == "GET":
+        rows = db.execute(
+            """SELECT id, name, active, created
+               FROM departments WHERE company_id = ?
+               ORDER BY name COLLATE NOCASE""",
+            (cid,),
+        ).fetchall()
+        return jsonify([dict(row) for row in rows])
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+
+    if not name or len(name) > 80:
+        return jsonify({"error": "Department name is required (maximum 80 characters)"}), 400
+
+    exists = db.execute(
+        """SELECT id FROM departments
+           WHERE company_id = ? AND lower(name) = lower(?)""",
+        (cid, name),
+    ).fetchone()
+    if exists:
+        return jsonify({"error": "That department already exists"}), 409
+
+    department_id = uuid.uuid4().hex[:12]
+    db.execute(
+        """INSERT INTO departments (id, company_id, name, active, created)
+           VALUES (?, ?, ?, 1, ?)""",
+        (department_id, cid, name, datetime.now().isoformat()),
+    )
+    db.commit()
+    return jsonify({"id": department_id, "name": name, "active": True}), 201
+
+
+@app.route('/api/departments/<department_id>', methods=['PATCH'])
+def update_company_department(department_id):
+    cid = session.get("company_id")
+    if not cid:
+        return jsonify({"error": "Authentication required"}), 401
+
+    db = get_db()
+    department = db.execute(
+        """SELECT id, name, active FROM departments
+           WHERE id = ? AND company_id = ?""",
+        (department_id, cid),
+    ).fetchone()
+
+    if not department:
+        return jsonify({"error": "Department not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", department["name"])).strip()
+    active = data.get("active", bool(department["active"]))
+
+    if not name or len(name) > 80:
+        return jsonify({"error": "Department name is required (maximum 80 characters)"}), 400
+    if not isinstance(active, bool):
+        return jsonify({"error": "active must be true or false"}), 400
+
+    duplicate = db.execute(
+        """SELECT id FROM departments
+           WHERE company_id = ? AND lower(name) = lower(?) AND id != ?""",
+        (cid, name, department_id),
+    ).fetchone()
+    if duplicate:
+        return jsonify({"error": "That department already exists"}), 409
+
+    db.execute(
+        "UPDATE departments SET name = ?, active = ? WHERE id = ? AND company_id = ?",
+        (name, int(active), department_id, cid),
+    )
+    db.execute(
+        "UPDATE users SET department = ? WHERE company_id = ? AND department_id = ?",
+        (name, cid, department_id),
+    )
+    db.commit()
+    return jsonify({"id": department_id, "name": name, "active": active})
+
+
+@app.route('/api/branches', methods=['GET', 'POST'])
+def company_branches():
+    cid = session.get("company_id")
+    if not cid:
+        return jsonify({"error": "Authentication required"}), 401
+
+    db = get_db()
+
+    if request.method == "GET":
+        rows = db.execute(
+            """SELECT id, name, address, active, created
+               FROM branches WHERE company_id = ?
+               ORDER BY name COLLATE NOCASE""",
+            (cid,),
+        ).fetchall()
+        return jsonify([dict(row) for row in rows])
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    address = str(data.get("address", "")).strip()
+
+    if not name or len(name) > 100:
+        return jsonify({"error": "Branch name is required (maximum 100 characters)"}), 400
+    if len(address) > 250:
+        return jsonify({"error": "Address must not exceed 250 characters"}), 400
+
+    exists = db.execute(
+        """SELECT id FROM branches
+           WHERE company_id = ? AND lower(name) = lower(?)""",
+        (cid, name),
+    ).fetchone()
+    if exists:
+        return jsonify({"error": "That branch already exists"}), 409
+
+    branch_id = uuid.uuid4().hex[:12]
+    db.execute(
+        """INSERT INTO branches
+           (id, company_id, name, address, active, created)
+           VALUES (?, ?, ?, ?, 1, ?)""",
+        (branch_id, cid, name, address, datetime.now().isoformat()),
+    )
+    db.commit()
+    return jsonify({
+        "id": branch_id,
+        "name": name,
+        "address": address,
+        "active": True,
+    }), 201
+
+
+@app.route('/api/branches/<branch_id>', methods=['PATCH'])
+def update_company_branch(branch_id):
+    cid = session.get("company_id")
+    if not cid:
+        return jsonify({"error": "Authentication required"}), 401
+
+    db = get_db()
+    branch = db.execute(
+        """SELECT id, name, address, active FROM branches
+           WHERE id = ? AND company_id = ?""",
+        (branch_id, cid),
+    ).fetchone()
+
+    if not branch:
+        return jsonify({"error": "Branch not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", branch["name"])).strip()
+    address = str(data.get("address", branch["address"])).strip()
+    active = data.get("active", bool(branch["active"]))
+
+    if not name or len(name) > 100:
+        return jsonify({"error": "Branch name is required (maximum 100 characters)"}), 400
+    if len(address) > 250:
+        return jsonify({"error": "Address must not exceed 250 characters"}), 400
+    if not isinstance(active, bool):
+        return jsonify({"error": "active must be true or false"}), 400
+
+    duplicate = db.execute(
+        """SELECT id FROM branches
+           WHERE company_id = ? AND lower(name) = lower(?) AND id != ?""",
+        (cid, name, branch_id),
+    ).fetchone()
+    if duplicate:
+        return jsonify({"error": "That branch already exists"}), 409
+
+    db.execute(
+        """UPDATE branches SET name = ?, address = ?, active = ?
+           WHERE id = ? AND company_id = ?""",
+        (name, address, int(active), branch_id, cid),
+    )
+    db.commit()
+    return jsonify({
+        "id": branch_id,
+        "name": name,
+        "address": address,
+        "active": active,
+    })
+
+
 @app.route('/api/staff', methods=['POST'])
 def add_staff():
     d = request.get_json(silent=True) or {}
@@ -427,10 +879,9 @@ def add_staff():
         return jsonify({"error": "Access denied"}), 403
     if not name or not email:
         return jsonify({"error": "Employee name and email are required"}), 400
-    if not isinstance(password, str) or len(password) < 10:
-        return jsonify({
-            "error": "Set an employee password with at least 10 characters"
-        }), 400
+    policy_error = password_policy_error(password)
+    if policy_error:
+        return jsonify({"error": policy_error}), 400
     if role not in ("staff", "HR"):
         return jsonify({"error": "Unsupported employee role"}), 400
 
@@ -442,14 +893,61 @@ def add_staff():
     if duplicate:
         return jsonify({"error": "An employee with this email already exists"}), 409
 
+    department_id = str(d.get("department_id", "")).strip()
+    branch_id = str(d.get("branch_id", "")).strip()
+    job_title = str(d.get("job_title", "")).strip()
+
+    if len(job_title) > 100:
+        return jsonify({"error": "Job title must not exceed 100 characters"}), 400
+
+    if department_id:
+        dept = db.execute(
+            """SELECT id, name FROM departments
+               WHERE id = ? AND company_id = ? AND active = 1""",
+            (department_id, cid),
+        ).fetchone()
+        if not dept:
+            return jsonify({"error": "Department not found or inactive"}), 400
+        department = dept["name"]
+    else:
+        dept = db.execute(
+            """SELECT id, name FROM departments
+               WHERE company_id = ? AND lower(name) = lower(?) AND active = 1""",
+            (cid, department),
+        ).fetchone()
+        if dept:
+            department_id = dept["id"]
+            department = dept["name"]
+        else:
+            department_id = uuid.uuid4().hex[:12]
+            db.execute(
+                """INSERT INTO departments
+                   (id, company_id, name, active, created)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (department_id, cid, department, datetime.now().isoformat()),
+            )
+
+    if branch_id:
+        branch = db.execute(
+            """SELECT id FROM branches
+               WHERE id = ? AND company_id = ? AND active = 1""",
+            (branch_id, cid),
+        ).fetchone()
+        if not branch:
+            return jsonify({"error": "Branch not found or inactive"}), 400
+    else:
+        branch_id = None
+
     uid = uuid.uuid4().hex[:8]
     db.execute(
         """INSERT INTO users
-           (id, company_id, name, email, role, department, photo,
-            photo_hash, password, created, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+           (id, company_id, name, email, role, department,
+            department_id, branch_id, job_title, photo, photo_hash,
+            password, created, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
         (
-            uid, cid, name, email, role, department, "default.png", "",
+            uid, cid, name, email, role, department, department_id,
+            branch_id, job_title, "default.png", "",
             generate_password_hash(password), datetime.now().isoformat()
         )
     )
@@ -498,8 +996,14 @@ def set_staff_active(cid, user_id):
 def list_staff(cid):
     db = get_db()
     rows = db.execute(
-        """SELECT id, name, email, role, department, created, active
-           FROM users WHERE company_id=? ORDER BY created DESC""",
+        """SELECT u.id, u.name, u.email, u.role, u.department,
+                  u.department_id, u.branch_id, u.job_title,
+                  b.name AS branch_name, u.created, u.active
+           FROM users u
+           LEFT JOIN branches b
+             ON b.id = u.branch_id AND b.company_id = u.company_id
+           WHERE u.company_id = ?
+           ORDER BY u.created DESC""",
         (cid,)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -1044,7 +1548,7 @@ def home():
 <h3>Register Your Company</h3>
 <input id="registerName" placeholder="Company name" autocomplete="organization">
 <input id="registerEmail" type="email" placeholder="Company email" autocomplete="email">
-<input id="registerPass" type="password" placeholder="Create password (at least 8 characters)" autocomplete="new-password">
+<input id="registerPass" type="password" placeholder="Create a strong password (12+ characters)" minlength="12" autocomplete="new-password" required>
 <button class="btn btn-black" onclick="registerCompany()">Create Company Account</button>
 <p>Already registered? <button type="button" onclick="showLoginForm()">Back to login</button></p>
 </div>
@@ -1053,7 +1557,36 @@ def home():
 </div>
 <div class="topbar"><h2 id="topTitle">Home</h2><div style="display:flex;align-items:center"><button onclick="doLogout()" style="background:#222;color:#fff;border:1px solid #333;padding:7px 14px;border-radius:20px;font-size:12px;margin-right:10px">Logout</button><div class="badge"><span id="compId">84c932fa</span></div></div></div>
 <div class="container"><div id="tab-home" class="tab active"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div class="card"><p>Staff</p><h3 id="stStaff" style="font-size:26px">0</h3></div><div class="card"><p>Present</p><h3 id="stPresent" style="font-size:26px">0</h3><p style="color:#10b981;font-size:11px">50m fence</p></div></div><div class="card"><h4>Live</h4><div id="liveList"></div></div></div>
-<div id="tab-staff" class="tab"><div class="card"><h4>Add Staff</h4><input id="sname" placeholder="Name"><input id="semail" placeholder="Email"><select id="srole"><option>staff</option><option>HR</option></select><input id="sdept" value="Engineering"><input id="spass" type="password" placeholder="Employee password (at least 10 characters)" minlength="10" autocomplete="new-password"><button class="btn btn-black" onclick="addStaff()">Add</button></div><div class="card"><h4>Staff - 50m</h4><div id="staffList"></div></div></div>
+<div id="tab-staff" class="tab">
+<div class="card">
+<h4>Add Employee</h4>
+<input id="sname" placeholder="Full name" autocomplete="name">
+<input id="semail" type="email" placeholder="Employee email" autocomplete="email">
+<select id="srole"><option value="staff">Staff</option><option value="HR">HR</option></select>
+<input id="sjobtitle" placeholder="Job title (e.g. Accountant)" maxlength="100">
+<label for="sdept">Department</label>
+<select id="sdept"><option value="">Loading departments...</option></select>
+<label for="sbranch">Branch / Factory (optional)</label>
+<select id="sbranch"><option value="">No branch assigned</option></select>
+<input id="spass" type="password" placeholder="Strong employee password (12+ characters)" minlength="12" autocomplete="new-password" required>
+<button class="btn btn-black" onclick="addStaff()">Add Employee</button>
+<p id="staffFormMessage" role="status"></p>
+</div>
+<div class="card">
+<h4>Departments</h4>
+<input id="newDepartmentName" placeholder="New department name" maxlength="80">
+<button class="btn btn-black" onclick="createDepartment()">Create Department</button>
+<div id="departmentList"></div>
+</div>
+<div class="card">
+<h4>Branches / Factories</h4>
+<input id="newBranchName" placeholder="Branch or factory name" maxlength="100">
+<input id="newBranchAddress" placeholder="Address (optional)" maxlength="250">
+<button class="btn btn-black" onclick="createBranch()">Create Branch</button>
+<div id="branchList"></div>
+</div>
+<div class="card"><h4>Employees</h4><div id="staffList"></div></div>
+</div>
 <div id="tab-time" class="tab"><div class="card"><h4>Attendance</h4><div id="clockBoard"></div><div id="attList" style="margin-top:10px"></div></div></div>
 <div id="tab-pay" class="tab"><div class="card"><h4>Plans</h4><button class="btn btn-black" onclick="openPay('pro',5000)">Pay Pro ₦5k</button></div><div class="card" style="display:none" id="payBox"><p>Acct <b id="mpAccount">-</b> Name <b id="mpName">-</b> Amt <b id="mpAmount">-</b></p><input id="proof" placeholder="ref"><button class="btn btn-black" onclick="submitProof()">Submit</button></div><div class="card"><div id="mySubs"></div></div></div>
 <div id="tab-settings" class="tab"><div class="card"><h4>Office GPS 50m</h4><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input id="setLat" type="number" step="0.000001"><input id="setLng" type="number" step="0.000001"></div><input id="setRadius" value="50" type="number"><button class="btn btn-ghost" onclick="useMyLocation()">📍 My Location</button><button class="btn btn-black" style="margin-top:8px" onclick="saveOffice()">Save Office</button><p id="officeStatus"></p></div><div class="card"><h4>Moniepoint</h4><input id="setAccount"><input id="setName"><button class="btn btn-black" onclick="saveSettings()">Save</button></div><div class="card"><h4>Approve</h4><div id="allSubs"></div><button class="btn btn-ghost" onclick="loadAllSubs()">Load</button></div></div></div>
@@ -1084,8 +1617,10 @@ async function registerCompany(){
         message.innerText='Please fill in all fields.';
         return;
     }
-    if(password.length<8){
-        message.innerText='Password must contain at least 8 characters.';
+    const policyError = window.saasPasswordError(password);
+    if(policyError){
+        message.innerText = policyError;
+        document.getElementById('registerPass').focus();
         return;
     }
 
@@ -1194,10 +1729,109 @@ async function doLogout(){
 
 checkSession();
 
-function navTo(t,el){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+t).classList.add('active');if(el){document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));el.classList.add('active');}if(t=='home')loadStats();if(t=='staff')loadStaff();if(t=='time')loadTimePage();if(t=='pay'){loadSettings();loadMySubs();}if(t=='settings'){loadSettings();loadAllSubs();}}
+function navTo(t,el){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+t).classList.add('active');if(el){document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));el.classList.add('active');}if(t=='home')loadStats();if(t=='staff'){loadOrgOptions();loadStaff();}if(t=='time')loadTimePage();if(t=='pay'){loadSettings();loadMySubs();}if(t=='settings'){loadSettings();loadAllSubs();}}
 async function loadStats(){let r=await fetch('/api/stats/'+CID);let d=await r.json();document.getElementById('stStaff').innerText=d.staff;document.getElementById('stPresent').innerText=d.present;}
-async function addStaff(){let body={company_id:CID,name:sname.value,email:semail.value,role:srole.value,department:sdept.value,password:spass.value};if(!body.name||!body.email)return alert('Name and email are required');if(!body.password||body.password.length<10)return alert('Set a password of at least 10 characters');let r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let d=await r.json();if(!r.ok)return alert(d.error||'Could not add employee');alert('Employee added. Share the password securely.');spass.value='';loadStaff();loadStats();}
-async function loadStaff(){let r=await fetch('/api/staff/'+CID);let staff=await r.json();let html='';for(let u of staff){let st=await (await fetch('/api/attendance/status/'+u.id)).json();let btn=st.status=='not_in'?`<button class="btn btn-black btn-sm" onclick="doClockIn('${u.id}')">In</button>`:st.status=='in'?`<button class="btn btn-ghost btn-sm" onclick="doClockOut('${u.id}')">Out ${Math.round(st.distance||0)}m</button>`:`Done ${Math.round(st.distance||0)}m ✓`;html+=`<div class="list-item"><div style="display:flex;gap:8px"><div class="avatar">${u.name[0].toUpperCase()}</div><div><b>${u.name}</b></div></div>${btn}</div>`;}document.getElementById('staffList').innerHTML=html||'No staff';document.getElementById('liveList').innerHTML=html;}
+function staffEscape(value){
+ return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+async function loadOrgOptions(){
+ const message=document.getElementById('staffFormMessage');
+ try{
+  const [dr,br]=await Promise.all([fetch('/api/departments'),fetch('/api/branches')]);
+  const departments=await dr.json();
+  const branches=await br.json();
+  if(!dr.ok||!br.ok)throw new Error(departments.error||branches.error||'Could not load departments and branches.');
+  const deptSelect=document.getElementById('sdept');
+  const branchSelect=document.getElementById('sbranch');
+  const oldDept=deptSelect.value,oldBranch=branchSelect.value;
+  const activeDepartments=departments.filter(d=>d.active);
+  const activeBranches=branches.filter(b=>b.active);
+  deptSelect.innerHTML='<option value="">Select a department</option>'+activeDepartments.map(d=>`<option value="${staffEscape(d.id)}">${staffEscape(d.name)}</option>`).join('');
+  branchSelect.innerHTML='<option value="">No branch assigned</option>'+activeBranches.map(b=>`<option value="${staffEscape(b.id)}">${staffEscape(b.name)}</option>`).join('');
+  if(activeDepartments.some(d=>d.id===oldDept))deptSelect.value=oldDept;
+  if(activeBranches.some(b=>b.id===oldBranch))branchSelect.value=oldBranch;
+  document.getElementById('departmentList').innerHTML=departments.map(d=>`<div class="list-item"><span>${staffEscape(d.name)}</span><span>${d.active?'Active':'Inactive'}</span></div>`).join('')||'<p>No departments yet.</p>';
+  document.getElementById('branchList').innerHTML=branches.map(b=>`<div class="list-item"><div><b>${staffEscape(b.name)}</b><br><small>${staffEscape(b.address||'No address added')}</small></div><span>${b.active?'Active':'Inactive'}</span></div>`).join('')||'<p>No branches yet.</p>';
+  if(message)message.textContent=activeDepartments.length?'':'Create a department below before adding an employee.';
+ }catch(error){if(message)message.textContent=error.message;else console.error(error);}
+}
+async function createDepartment(){
+ const input=document.getElementById('newDepartmentName');
+ const name=input.value.trim();
+ if(!name)return alert('Enter a department name.');
+ try{
+  const r=await fetch('/api/departments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const d=await r.json();
+  if(!r.ok)return alert(d.error||'Could not create department.');
+  input.value='';
+  await loadOrgOptions();
+  document.getElementById('sdept').value=d.id;
+  alert('Department created.');
+ }catch(error){alert('Could not create department. Check your connection.');}
+}
+async function createBranch(){
+ const name=document.getElementById('newBranchName').value.trim();
+ const address=document.getElementById('newBranchAddress').value.trim();
+ if(!name)return alert('Enter a branch or factory name.');
+ try{
+  const r=await fetch('/api/branches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,address})});
+  const d=await r.json();
+  if(!r.ok)return alert(d.error||'Could not create branch.');
+  document.getElementById('newBranchName').value='';
+  document.getElementById('newBranchAddress').value='';
+  await loadOrgOptions();
+  document.getElementById('sbranch').value=d.id;
+  alert('Branch created.');
+ }catch(error){alert('Could not create branch. Check your connection.');}
+}
+async function addStaff(){
+ const body={
+  company_id:CID,
+  name:document.getElementById('sname').value.trim(),
+  email:document.getElementById('semail').value.trim(),
+  role:document.getElementById('srole').value,
+  department_id:document.getElementById('sdept').value,
+  branch_id:document.getElementById('sbranch').value,
+  job_title:document.getElementById('sjobtitle').value.trim(),
+  password:document.getElementById('spass').value
+ };
+ const message=document.getElementById('staffFormMessage');
+ if(!body.name||!body.email){message.textContent='Name and email are required.';return;}
+ if(!body.department_id){message.textContent='Create and select a department first.';return;}
+ const policyError=window.saasPasswordError(body.password);
+ if(policyError){
+  message.textContent=policyError;
+  document.getElementById('spass').focus();
+  return;
+ }
+ try{
+  const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json();
+  if(!r.ok){message.textContent=d.error||'Could not add employee.';return;}
+  message.textContent='Employee added. Share the password securely.';
+  document.getElementById('spass').value='';
+  document.getElementById('sname').value='';
+  document.getElementById('semail').value='';
+  document.getElementById('sjobtitle').value='';
+  await loadStaff();
+  await loadStats();
+ }catch(error){message.textContent='Could not add employee. Check your connection.';}
+}
+async function loadStaff(){
+ const r=await fetch('/api/staff/'+encodeURIComponent(CID));
+ const staff=await r.json();
+ if(!r.ok){document.getElementById('staffList').textContent=staff.error||'Could not load employees.';return;}
+ let html='';
+ for(const u of staff){
+  let status={status:'unknown'};
+  try{status=await (await fetch('/api/attendance/status/'+encodeURIComponent(u.id))).json();}catch(e){}
+  const btn=status.status==='not_in'?`<button class="btn btn-black btn-sm" onclick="doClockIn('${staffEscape(u.id)}')">In</button>`:status.status==='in'?`<button class="btn btn-ghost btn-sm" onclick="doClockOut('${staffEscape(u.id)}')">Out ${Math.round(status.distance||0)}m</button>`:status.status==='done'?`Done ${Math.round(status.distance||0)}m ✓`:'';
+  const details=[u.job_title,u.department,u.branch_name].filter(Boolean).map(staffEscape).join(' · ');
+  html+=`<div class="list-item"><div style="display:flex;gap:8px;align-items:center"><div class="avatar">${staffEscape((u.name||'?').charAt(0).toUpperCase())}</div><div><b>${staffEscape(u.name)}</b><br><small>${staffEscape(u.email||'')}<br>${details||'No assignment details'} · ${staffEscape(u.role)} · ${u.active?'Active':'Inactive'}</small></div></div>${btn}</div>`;
+ }
+ document.getElementById('staffList').innerHTML=html||'No employees yet.';
+ document.getElementById('liveList').innerHTML=html;
+}
 async function loadTimePage(){let r=await fetch('/api/staff/'+CID);let staff=await r.json();let board='';for(let u of staff){let st=await (await fetch('/api/attendance/status/'+u.id)).json();let btn=st.status=='not_in'?`<button class="btn btn-black btn-sm" onclick="doClockIn('${u.id}')">IN</button>`:st.status=='in'?`<button class="btn btn-ghost btn-sm" onclick="doClockOut('${u.id}')">OUT</button>`:`✓`;board+=`<div class="list-item"><b>${u.name}</b> ${btn}</div>`;}document.getElementById('clockBoard').innerHTML=board;loadAtt();}
 async function doClockIn(uid){navigator.geolocation.getCurrentPosition(async pos=>{let r=await fetch('/api/attendance/clock-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:CID,user_id:uid,lat:pos.coords.latitude,lng:pos.coords.longitude,photo_hash:btoa(uid+Date.now()).slice(0,40)})});let j=await r.json();alert(j.msg);loadStaff();loadTimePage();loadStats();},()=>alert('Enable GPS'),{enableHighAccuracy:true});}
 async function doClockOut(uid){let r=await fetch('/api/attendance/clock-out',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:CID,user_id:uid})});let j=await r.json();alert(j.msg);loadStaff();loadTimePage();loadStats();}
@@ -1508,6 +2142,7 @@ def owner_login():
 
     session.clear()
     session['platform_admin_id'] = admin['id']
+    session['auth_version'] = get_or_create_auth_version("owner", admin['id'])
     return jsonify({"authenticated": True, "email": admin['email']})
 
 @app.route('/api/owner/session')
@@ -1726,6 +2361,16 @@ def password_recovery_request():
     if company:
         accounts.append(("company", company["id"], company["email"]))
 
+    employees = db.execute(
+        """SELECT id, email FROM users
+           WHERE lower(email)=? AND active=1
+             AND email IS NOT NULL AND trim(email)<>''""",
+        (email,)
+    ).fetchall()
+
+    for employee in employees:
+        accounts.append(("employee", employee["id"], employee["email"]))
+
     # Always return the same public response, regardless of account existence.
     if not accounts:
         return jsonify(generic), 200
@@ -1781,8 +2426,9 @@ def password_recovery_reset():
 
     if not isinstance(token, str) or not token or len(token) > 200:
         return jsonify({"error": "Invalid or expired reset link"}), 400
-    if not isinstance(password, str) or len(password) < 12:
-        return jsonify({"error": "Password must be at least 12 characters"}), 400
+    policy_error = password_policy_error(password)
+    if policy_error:
+        return jsonify({"error": policy_error}), 400
 
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     password_hash = generate_password_hash(password)
@@ -1826,6 +2472,11 @@ def password_recovery_reset():
                 "UPDATE companies SET password=? WHERE id=?",
                 (password_hash, reset["account_id"])
             )
+        elif reset["account_type"] == "employee":
+            cursor = db.execute(
+                "UPDATE users SET password=? WHERE id=? AND active=1",
+                (password_hash, reset["account_id"])
+            )
         else:
             db.rollback()
             return jsonify({"error": "Invalid or expired reset link"}), 400
@@ -1833,6 +2484,17 @@ def password_recovery_reset():
         if cursor.rowcount != 1:
             db.rollback()
             return jsonify({"error": "Invalid or expired reset link"}), 400
+
+        # Incrementing this value revokes sessions issued before this reset.
+        db.execute(
+            """
+            INSERT INTO auth_versions (account_type, account_id, version)
+            VALUES (?, ?, 2)
+            ON CONFLICT(account_type, account_id)
+            DO UPDATE SET version = auth_versions.version + 1
+            """,
+            (reset["account_type"], str(reset["account_id"])),
+        )
 
         consumed = db.execute(
             "UPDATE password_resets SET used=1 WHERE id=? AND used=0",
@@ -1941,7 +2603,7 @@ a{color:#333}#message{overflow-wrap:anywhere}
 <h3>Choose a new password</h3>
 <p>Use at least 12 characters.</p>
 <form id="resetForm">
-<input id="password" type="password" autocomplete="new-password" minlength="12" placeholder="New password (12+ characters)" required>
+<input id="password" type="password" autocomplete="new-password" minlength="12" placeholder="New strong password (12+ characters)" required>
 <input id="confirm" type="password" autocomplete="new-password" minlength="12" placeholder="Confirm new password" required>
 <button type="submit">Reset Password</button>
 </form>
@@ -1960,8 +2622,17 @@ form.addEventListener('submit',async function(event){
     event.preventDefault();
     const password=document.getElementById('password').value;
     const confirm=document.getElementById('confirm').value;
-    if(password.length<12){message.textContent='Password must contain at least 12 characters.';return;}
-    if(password!==confirm){message.textContent='The passwords do not match.';return;}
+    const policyError = window.saasPasswordError(password);
+    if(policyError){
+        message.textContent = policyError;
+        document.getElementById('password').focus();
+        return;
+    }
+    if(password!==confirm){
+        message.textContent='The passwords do not match.';
+        document.getElementById('confirm').focus();
+        return;
+    }
     const button=form.querySelector('button');
     button.disabled=true;
     message.textContent='Resetting password...';

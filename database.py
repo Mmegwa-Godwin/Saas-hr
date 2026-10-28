@@ -1,4 +1,5 @@
 import sqlite3
+import uuid
 
 from flask import current_app, g
 
@@ -32,6 +33,18 @@ def init_db():
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        )
+        """
+    )
+    db.commit()
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_versions (
+            account_type TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (account_type, account_id)
         )
         """
     )
@@ -116,6 +129,96 @@ def init_db():
     user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
     if "active" not in user_columns:
         db.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS departments (
+            id TEXT PRIMARY KEY,
+            company_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created TEXT NOT NULL,
+            UNIQUE(company_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS branches (
+            id TEXT PRIMARY KEY,
+            company_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created TEXT NOT NULL,
+            UNIQUE(company_id, name)
+        );
+        """
+    )
+
+    # Additive migrations preserve existing employee records.
+    user_columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(users)").fetchall()
+    }
+    for column, definition in (
+        ("department_id", "TEXT"),
+        ("branch_id", "TEXT"),
+        ("job_title", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in user_columns:
+            db.execute(
+                f"ALTER TABLE users ADD COLUMN {column} {definition}"
+            )
+
+    # Convert existing department text values into company-owned records.
+    existing_departments = db.execute(
+        """
+        SELECT DISTINCT company_id, TRIM(department) AS name
+        FROM users
+        WHERE company_id IS NOT NULL
+          AND TRIM(COALESCE(department, '')) <> ''
+        """
+    ).fetchall()
+
+    for row in existing_departments:
+        company_id = row["company_id"]
+        name = row["name"]
+        department = db.execute(
+            """
+            SELECT id FROM departments
+            WHERE company_id = ? AND name = ?
+            """,
+            (company_id, name),
+        ).fetchone()
+
+        if department is None:
+            department_id = uuid.uuid4().hex[:12]
+            db.execute(
+                """
+                INSERT OR IGNORE INTO departments
+                    (id, company_id, name, active, created)
+                VALUES (?, ?, ?, 1, datetime('now'))
+                """,
+                (department_id, company_id, name),
+            )
+            department = db.execute(
+                """
+                SELECT id FROM departments
+                WHERE company_id = ? AND name = ?
+                """,
+                (company_id, name),
+            ).fetchone()
+
+        if department:
+            db.execute(
+                """
+                UPDATE users SET department_id = ?
+                WHERE company_id = ?
+                  AND TRIM(COALESCE(department, '')) = ?
+                  AND (department_id IS NULL OR department_id = '')
+                """,
+                (department["id"], company_id, name),
+            )
+
+    db.commit()
 
     db.execute(
         """

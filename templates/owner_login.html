@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SaaS-HR Platform Owner</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/owner-login.css') }}">
+</head>
+<body>
+<div class="card">
+<h1>SaaS-HR Owner</h1>
+<p>Sign in to manage your SaaS-HR platform.</p>
+<form id="loginForm">
+<input id="email" type="email" autocomplete="username" placeholder="Owner email" required>
+<input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+<button id="submit" type="submit">Sign in</button>
+</form>
+<p style="text-align:right;margin:8px 0"><a href="/forgot-password">Forgot password?</a></p>
+<p id="message" role="status" aria-live="polite"></p>
+</div>
+
+
+<script src="{{ url_for('static', filename='js/owner-login.js') }}" defer></script>
+</body>
+</html>

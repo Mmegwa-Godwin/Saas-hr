@@ -26,15 +26,21 @@ def authenticate_employee(company_id, email, password):
     db = get_db()
     employee = db.execute(
         """SELECT u.id, u.company_id, u.name, u.email, u.role, u.password,
-                  u.active, c.name AS company_name
+                  u.active, u.employment_status, c.name AS company_name,
+                  COALESCE(cl.status, 'active') AS company_status
            FROM users u
            JOIN companies c ON c.id = u.company_id
+           LEFT JOIN company_lifecycle cl ON cl.company_id = c.id
            WHERE u.company_id = ? AND lower(u.email) = ?""",
         (company_id, email),
     ).fetchone()
     if not employee:
         return None
     if not employee["active"]:
+        return None
+    if employee["employment_status"] not in ("active", "on_leave"):
+        return None
+    if employee["company_status"] != "active":
         return None
     if not check_password_hash(employee["password"], password):
         return None

@@ -1,0 +1,8 @@
+*{box-sizing:border-box;font-family:Arial,sans-serif}
+body{margin:0;background:#f1f5f9;min-height:100vh;display:grid;place-items:center;padding:20px}
+.card{background:white;padding:28px;border-radius:16px;width:100%;max-width:420px;box-shadow:0 8px 30px #0001}
+h1{font-size:25px;margin-bottom:8px}p{color:#64748b}
+input,button{width:100%;padding:14px;margin-top:14px;border-radius:9px;font-size:16px}
+input{border:1px solid #cbd5e1}
+button{background:#111827;color:white;border:0;cursor:pointer}
+#message{overflow-wrap:anywhere;color:#b91c1c}

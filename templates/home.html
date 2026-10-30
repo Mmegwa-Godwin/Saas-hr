@@ -1,0 +1,62 @@
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://cdnjs.cloudflare.com/ajax/libs/remixicon/4.2.0/remixicon.min.css" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}"></head><body>
+<div id="loginScreen" class="login">
+<div class="card" style="width:100%;max-width:380px">
+<h2>SaaS-HR</h2>
+<p>Create your company account or log in.</p>
+<div id="loginForm">
+<h3>Company Login</h3>
+<input id="loginEmail" type="email" placeholder="Company email" autocomplete="username">
+<input id="loginPass" type="password" placeholder="Password" autocomplete="current-password">
+<p style="text-align:right;margin:8px 0"><a href="/forgot-password">Forgot password?</a></p>
+<button class="btn btn-black" onclick="doLogin()">Login</button>
+<p>New to SaaS-HR? <button type="button" onclick="showRegisterForm()">Register a company</button></p>
+</div>
+<div id="registerForm" style="display:none">
+<h3>Register Your Company</h3>
+<input id="registerName" placeholder="Company name" autocomplete="organization">
+<input id="registerEmail" type="email" placeholder="Company email" autocomplete="email">
+<input id="registerPass" type="password" placeholder="Create a strong password (12+ characters)" minlength="12" autocomplete="new-password" required>
+<button class="btn btn-black" onclick="registerCompany()">Create Company Account</button>
+<p>Already registered? <button type="button" onclick="showLoginForm()">Back to login</button></p>
+</div>
+<p id="registerMessage" role="status"></p>
+</div>
+</div>
+<div class="topbar"><h2 id="topTitle">Home</h2><div style="display:flex;align-items:center"><button onclick="doLogout()" style="background:#222;color:#fff;border:1px solid #333;padding:7px 14px;border-radius:20px;font-size:12px;margin-right:10px">Logout</button><div class="badge"><span id="compId">84c932fa</span></div></div></div>
+<div class="container"><div id="tab-home" class="tab active"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div class="card"><p>Staff</p><h3 id="stStaff" style="font-size:26px">0</h3></div><div class="card"><p>Present</p><h3 id="stPresent" style="font-size:26px">0</h3><p style="color:#10b981;font-size:11px">50m fence</p></div></div><div class="card"><h4>Live</h4><div id="liveList"></div></div></div>
+<div id="tab-staff" class="tab">
+<div class="card">
+<h4>Add Employee</h4>
+<input id="sname" placeholder="Full name" autocomplete="name">
+<input id="semail" type="email" placeholder="Employee email" autocomplete="email">
+<select id="srole"><option value="staff">Staff</option><option value="HR">HR</option></select>
+<input id="sjobtitle" placeholder="Job title (e.g. Accountant)" maxlength="100">
+<label for="sdept">Department</label>
+<select id="sdept"><option value="">Loading departments...</option></select>
+<label for="sbranch">Branch / Factory (optional)</label>
+<select id="sbranch"><option value="">No branch assigned</option></select>
+<input id="spass" type="password" placeholder="Strong employee password (12+ characters)" minlength="12" autocomplete="new-password" required>
+<button class="btn btn-black" onclick="addStaff()">Add Employee</button>
+<p id="staffFormMessage" role="status"></p>
+</div>
+<div class="card">
+<h4>Departments</h4>
+<input id="newDepartmentName" placeholder="New department name" maxlength="80">
+<button class="btn btn-black" onclick="createDepartment()">Create Department</button>
+<div id="departmentList"></div>
+</div>
+<div class="card">
+<h4>Branches / Factories</h4>
+<input id="newBranchName" placeholder="Branch or factory name" maxlength="100">
+<input id="newBranchAddress" placeholder="Address (optional)" maxlength="250">
+<button class="btn btn-black" onclick="createBranch()">Create Branch</button>
+<div id="branchList"></div>
+</div>
+<div class="card"><h4>Employees</h4><div id="staffList"></div></div>
+</div>
+<div id="tab-time" class="tab"><div class="card"><h4>Attendance</h4><div id="clockBoard"></div><div id="attList" style="margin-top:10px"></div></div></div>
+<div id="tab-pay" class="tab"><div class="card"><h4>Plans</h4><button class="btn btn-black" onclick="openPay('pro',5000)">Pay Pro ₦5k</button></div><div class="card" style="display:none" id="payBox"><p>Acct <b id="mpAccount">-</b> Name <b id="mpName">-</b> Amt <b id="mpAmount">-</b></p><input id="proof" placeholder="ref"><button class="btn btn-black" onclick="submitProof()">Submit</button></div><div class="card"><div id="mySubs"></div></div></div>
+<div id="tab-settings" class="tab"><div class="card"><h4>Office GPS 50m</h4><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input id="setLat" type="number" step="0.000001"><input id="setLng" type="number" step="0.000001"></div><input id="setRadius" value="50" type="number"><button class="btn btn-ghost" onclick="useMyLocation()">📍 My Location</button><button class="btn btn-black" style="margin-top:8px" onclick="saveOffice()">Save Office</button><p id="officeStatus"></p></div><div class="card"><h4>Moniepoint</h4><input id="setAccount"><input id="setName"><button class="btn btn-black" onclick="saveSettings()">Save</button></div><div class="card"><h4>Approve</h4><div id="allSubs"></div><button class="btn btn-ghost" onclick="loadAllSubs()">Load</button></div></div></div>
+<div class="bottom-nav"><div class="nav-item active" onclick="navTo('home',this)"><i class="ri-home-5-fill"></i>Home</div><div class="nav-item" onclick="navTo('staff',this)"><i class="ri-team-line"></i>Staff</div><div class="nav-item" onclick="navTo('time',this)"><i class="ri-time-line"></i>Time</div><div class="nav-item" onclick="navTo('pay',this)"><i class="ri-wallet-3-line"></i>Pay</div><div class="nav-item" onclick="navTo('settings',this)"><i class="ri-settings-3-line"></i>You</div></div>
+<script src="{{ url_for('static', filename='js/app.js') }}" defer></script></body></html>

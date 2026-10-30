@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SaaS-HR Platform Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/owner-dashboard.css') }}">
+</head>
+<body>
+<header>
+<h1>SaaS-HR Platform Owner</h1>
+<div><span id="ownerEmail"></span> <button id="logout">Log out</button></div>
+</header>
+<main>
+<p id="message" role="status" aria-live="polite">Checking owner session...</p>
+<section>
+<h2>Registered Companies</h2>
+<div id="companies">Loading companies...</div>
+</section>
+<section>
+<h2>Subscriptions</h2>
+<div id="subscriptions">Loading subscriptions...</div>
+</section>
+</main>
+
+
+<script src="{{ url_for('static', filename='js/owner-dashboard.js') }}" defer></script>
+</body>
+</html>

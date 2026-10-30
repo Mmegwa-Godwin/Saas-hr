@@ -84,7 +84,11 @@ try:
 
     with app_module.app.app_context():
         db = app_module.get_db()
-        db.execute("UPDATE users SET active=1 WHERE id='u1'")
+        db.execute(
+            """UPDATE users
+               SET active=1, employment_status='active'
+               WHERE id='u1'"""
+        )
         db.commit()
 
     reactivated_login = login(token)

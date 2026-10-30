@@ -126,9 +126,59 @@ def init_db():
         """
     )
 
+    # Company lifecycle and employee employment status.
+    # Separate company table preserves the legacy companies column layout.
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS company_lifecycle (
+            company_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'active',
+            reason TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT 'system',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS lifecycle_status_history (
+            id TEXT PRIMARY KEY,
+            company_id TEXT NOT NULL,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            old_status TEXT NOT NULL,
+            new_status TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            changed_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_lifecycle_history_subject
+        ON lifecycle_status_history(company_id, subject_type, subject_id, created_at);
+        """
+    )
+
     user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
     if "active" not in user_columns:
         db.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+
+    user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+    if "employment_status" not in user_columns:
+        db.execute(
+            "ALTER TABLE users ADD COLUMN employment_status TEXT NOT NULL DEFAULT 'active'"
+        )
+
+    # Preserve the meaning of existing deactivated accounts.
+    db.execute(
+        """UPDATE users SET employment_status='inactive'
+           WHERE active=0 AND employment_status='active'"""
+    )
+
+    # Existing companies remain operational unless explicitly changed.
+    db.execute(
+        """INSERT OR IGNORE INTO company_lifecycle
+           (company_id, status, reason, updated_by, updated_at)
+           SELECT id, 'active', 'Existing company migration', 'system', datetime('now')
+           FROM companies"""
+    )
+    db.commit()
 
     db.executescript(
         """

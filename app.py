@@ -10,7 +10,7 @@ try:
 except ImportError:
     pass
 
-from flask import Flask, request, jsonify, g, render_template_string, session, abort
+from flask import Flask, request, jsonify, g, render_template, render_template_string, session, abort
 from email.message import EmailMessage
 from urllib.parse import urlparse
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -147,12 +147,24 @@ def security_guard():
     if employee_id:
         cid = session.get('company_id')
         employee_record = get_db().execute(
-            "SELECT active FROM users WHERE id=? AND company_id=?",
+            """SELECT active, employment_status
+               FROM users WHERE id=? AND company_id=?""",
             (employee_id, cid)
         ).fetchone()
         if not employee_record or not employee_record["active"]:
             session.clear()
             return jsonify({"error": "Employee account is inactive"}), 401
+
+        if employee_record["employment_status"] not in ("active", "on_leave"):
+            session.clear()
+            return jsonify({"error": "Employee status does not permit access"}), 401
+
+        company_lifecycle = get_db().execute(
+            "SELECT status FROM company_lifecycle WHERE company_id=?",
+            (cid,)
+        ).fetchone()
+        if not company_lifecycle or company_lifecycle["status"] != "active":
+            return jsonify({"error": "Company operations are currently unavailable"}), 423
 
         if (
             request.method == 'GET'
@@ -167,6 +179,9 @@ def security_guard():
                 '/api/attendance/clock-out',
             )
         ):
+            if employee_record["employment_status"] == "on_leave":
+                return jsonify({"error": "Attendance is disabled while you are on leave"}), 403
+
             data = request.get_json(silent=True) or {}
 
             if str(data.get('user_id', '')) != str(employee_id):
@@ -195,6 +210,18 @@ def security_guard():
     cid = session.get('company_id')
     if not cid or session.get('platform_admin_id'):
         return jsonify({"error": "Authentication required"}), 401
+
+    # A non-active company can only inspect its lifecycle status.
+    lifecycle_row = get_db().execute(
+        "SELECT status FROM company_lifecycle WHERE company_id=?",
+        (cid,)
+    ).fetchone()
+    operational_status = lifecycle_row["status"] if lifecycle_row else "active"
+    if operational_status != "active" and path != "/api/company/lifecycle":
+        return jsonify({
+            "error": "Company operations are unavailable",
+            "company_status": operational_status
+        }), 423
 
     # Keep legacy platform-wide subscription routes blocked.
     if path == '/api/subscriptions/all' or path.startswith('/api/subscriptions/approve/'):
@@ -631,14 +658,28 @@ def employee_session():
         return jsonify({"authenticated": False}), 401
 
     employee = get_db().execute(
-        """SELECT id, company_id, name, email, role, active
+        """SELECT id, company_id, name, email, role, active, employment_status
            FROM users WHERE id = ? AND company_id = ?""",
         (employee_id, company_id)
     ).fetchone()
 
-    if not employee or not employee["active"]:
+    if (
+        not employee
+        or not employee["active"]
+        or employee["employment_status"] not in ("active", "on_leave")
+    ):
         session.clear()
         return jsonify({"authenticated": False}), 401
+
+    company_state = get_db().execute(
+        "SELECT status FROM company_lifecycle WHERE company_id=?",
+        (company_id,)
+    ).fetchone()
+    if not company_state or company_state["status"] != "active":
+        return jsonify({
+            "authenticated": False,
+            "company_status": company_state["status"] if company_state else "unknown"
+        }), 423
 
     return jsonify({
         "authenticated": True,
@@ -972,22 +1013,40 @@ def set_staff_active(cid, user_id):
 
     db = get_db()
     employee = db.execute(
-        "SELECT id, active FROM users WHERE id=? AND company_id=?",
+        "SELECT id, active, employment_status FROM users WHERE id=? AND company_id=?",
         (user_id, company_id)
     ).fetchone()
 
     if not employee:
         return jsonify({"error": "Employee not found"}), 404
 
-    db.execute(
-        "UPDATE users SET active=? WHERE id=? AND company_id=?",
-        (1 if active else 0, user_id, company_id)
+    old_status = employee["employment_status"] or (
+        "active" if employee["active"] else "inactive"
     )
+    new_status = "active" if active else "inactive"
+    db.execute(
+        """UPDATE users SET active=?, employment_status=?
+           WHERE id=? AND company_id=?""",
+        (1 if active else 0, new_status, user_id, company_id)
+    )
+    if old_status != new_status:
+        db.execute(
+            """INSERT INTO lifecycle_status_history
+               (id, company_id, subject_type, subject_id, old_status,
+                new_status, reason, changed_by, created_at)
+               VALUES (?, ?, 'employee', ?, ?, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex, company_id, user_id, old_status,
+                new_status, "Legacy active toggle", company_id,
+                datetime.now().isoformat()
+            )
+        )
     db.commit()
 
     return jsonify({
         "id": user_id,
         "active": active,
+        "employment_status": new_status,
         "message": "Employee activated" if active else "Employee deactivated"
     })
 
@@ -998,7 +1057,8 @@ def list_staff(cid):
     rows = db.execute(
         """SELECT u.id, u.name, u.email, u.role, u.department,
                   u.department_id, u.branch_id, u.job_title,
-                  b.name AS branch_name, u.created, u.active
+                  b.name AS branch_name, u.created, u.active,
+                  u.employment_status
            FROM users u
            LEFT JOIN branches b
              ON b.id = u.branch_id AND b.company_id = u.company_id
@@ -1529,324 +1589,7 @@ def favicon():
 
 @app.route('/')
 def home():
-    return render_template_string("""
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://cdnjs.cloudflare.com/ajax/libs/remixicon/4.2.0/remixicon.min.css" rel="stylesheet">
-<style>*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont}body{background:#f5f6f8;padding-bottom:90px}.topbar{background:#0a0a0a;color:#fff;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10}.badge{background:#1a1a1a;border:1px solid #2a2a2a;padding:6px 12px;border-radius:20px;font-size:11px}.card{background:#fff;border-radius:20px;padding:16px;margin-top:12px}.tab{display:none}.tab.active{display:block}.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:#fff;display:flex;justify-content:space-around;padding:8px 0 20px;border-top:1px solid #eee;z-index:20}.nav-item{flex:1;text-align:center;color:#9a9a9a;font-size:10px;cursor:pointer}.nav-item.active{color:#000}.nav-item i{font-size:22px;display:block}.btn{width:100%;padding:14px;border-radius:14px;border:0;font-weight:700;cursor:pointer}.btn-black{background:#000;color:#fff}.btn-ghost{background:#f5f5f5}.btn-sm{width:auto;padding:8px 14px;font-size:12px}input,select{width:100%;padding:14px;border-radius:14px;border:1.5px solid #eee;margin:7px 0}.list-item{display:flex;justify-content:space-between;padding:14px 0;border-bottom:1px solid #f6f6f6}.avatar{width:42px;height:42px;background:#111;color:#fff;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800}.login{position:fixed;inset:0;background:#000;z-index:100;display:flex;align-items:center;justify-content:center;padding:20px}</style></head><body>
-<div id="loginScreen" class="login">
-<div class="card" style="width:100%;max-width:380px">
-<h2>SaaS-HR</h2>
-<p>Create your company account or log in.</p>
-<div id="loginForm">
-<h3>Company Login</h3>
-<input id="loginEmail" type="email" placeholder="Company email" autocomplete="username">
-<input id="loginPass" type="password" placeholder="Password" autocomplete="current-password">
-<p style="text-align:right;margin:8px 0"><a href="/forgot-password">Forgot password?</a></p>
-<button class="btn btn-black" onclick="doLogin()">Login</button>
-<p>New to SaaS-HR? <button type="button" onclick="showRegisterForm()">Register a company</button></p>
-</div>
-<div id="registerForm" style="display:none">
-<h3>Register Your Company</h3>
-<input id="registerName" placeholder="Company name" autocomplete="organization">
-<input id="registerEmail" type="email" placeholder="Company email" autocomplete="email">
-<input id="registerPass" type="password" placeholder="Create a strong password (12+ characters)" minlength="12" autocomplete="new-password" required>
-<button class="btn btn-black" onclick="registerCompany()">Create Company Account</button>
-<p>Already registered? <button type="button" onclick="showLoginForm()">Back to login</button></p>
-</div>
-<p id="registerMessage" role="status"></p>
-</div>
-</div>
-<div class="topbar"><h2 id="topTitle">Home</h2><div style="display:flex;align-items:center"><button onclick="doLogout()" style="background:#222;color:#fff;border:1px solid #333;padding:7px 14px;border-radius:20px;font-size:12px;margin-right:10px">Logout</button><div class="badge"><span id="compId">84c932fa</span></div></div></div>
-<div class="container"><div id="tab-home" class="tab active"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div class="card"><p>Staff</p><h3 id="stStaff" style="font-size:26px">0</h3></div><div class="card"><p>Present</p><h3 id="stPresent" style="font-size:26px">0</h3><p style="color:#10b981;font-size:11px">50m fence</p></div></div><div class="card"><h4>Live</h4><div id="liveList"></div></div></div>
-<div id="tab-staff" class="tab">
-<div class="card">
-<h4>Add Employee</h4>
-<input id="sname" placeholder="Full name" autocomplete="name">
-<input id="semail" type="email" placeholder="Employee email" autocomplete="email">
-<select id="srole"><option value="staff">Staff</option><option value="HR">HR</option></select>
-<input id="sjobtitle" placeholder="Job title (e.g. Accountant)" maxlength="100">
-<label for="sdept">Department</label>
-<select id="sdept"><option value="">Loading departments...</option></select>
-<label for="sbranch">Branch / Factory (optional)</label>
-<select id="sbranch"><option value="">No branch assigned</option></select>
-<input id="spass" type="password" placeholder="Strong employee password (12+ characters)" minlength="12" autocomplete="new-password" required>
-<button class="btn btn-black" onclick="addStaff()">Add Employee</button>
-<p id="staffFormMessage" role="status"></p>
-</div>
-<div class="card">
-<h4>Departments</h4>
-<input id="newDepartmentName" placeholder="New department name" maxlength="80">
-<button class="btn btn-black" onclick="createDepartment()">Create Department</button>
-<div id="departmentList"></div>
-</div>
-<div class="card">
-<h4>Branches / Factories</h4>
-<input id="newBranchName" placeholder="Branch or factory name" maxlength="100">
-<input id="newBranchAddress" placeholder="Address (optional)" maxlength="250">
-<button class="btn btn-black" onclick="createBranch()">Create Branch</button>
-<div id="branchList"></div>
-</div>
-<div class="card"><h4>Employees</h4><div id="staffList"></div></div>
-</div>
-<div id="tab-time" class="tab"><div class="card"><h4>Attendance</h4><div id="clockBoard"></div><div id="attList" style="margin-top:10px"></div></div></div>
-<div id="tab-pay" class="tab"><div class="card"><h4>Plans</h4><button class="btn btn-black" onclick="openPay('pro',5000)">Pay Pro ₦5k</button></div><div class="card" style="display:none" id="payBox"><p>Acct <b id="mpAccount">-</b> Name <b id="mpName">-</b> Amt <b id="mpAmount">-</b></p><input id="proof" placeholder="ref"><button class="btn btn-black" onclick="submitProof()">Submit</button></div><div class="card"><div id="mySubs"></div></div></div>
-<div id="tab-settings" class="tab"><div class="card"><h4>Office GPS 50m</h4><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input id="setLat" type="number" step="0.000001"><input id="setLng" type="number" step="0.000001"></div><input id="setRadius" value="50" type="number"><button class="btn btn-ghost" onclick="useMyLocation()">📍 My Location</button><button class="btn btn-black" style="margin-top:8px" onclick="saveOffice()">Save Office</button><p id="officeStatus"></p></div><div class="card"><h4>Moniepoint</h4><input id="setAccount"><input id="setName"><button class="btn btn-black" onclick="saveSettings()">Save</button></div><div class="card"><h4>Approve</h4><div id="allSubs"></div><button class="btn btn-ghost" onclick="loadAllSubs()">Load</button></div></div></div>
-<div class="bottom-nav"><div class="nav-item active" onclick="navTo('home',this)"><i class="ri-home-5-fill"></i>Home</div><div class="nav-item" onclick="navTo('staff',this)"><i class="ri-team-line"></i>Staff</div><div class="nav-item" onclick="navTo('time',this)"><i class="ri-time-line"></i>Time</div><div class="nav-item" onclick="navTo('pay',this)"><i class="ri-wallet-3-line"></i>Pay</div><div class="nav-item" onclick="navTo('settings',this)"><i class="ri-settings-3-line"></i>You</div></div>
-<script>
-let CID='';
-const loginScreen=document.getElementById('loginScreen');
-
-function showRegisterForm(){
-    document.getElementById('loginForm').style.display='none';
-    document.getElementById('registerForm').style.display='block';
-    document.getElementById('registerMessage').innerText='';
-}
-
-function showLoginForm(){
-    document.getElementById('registerForm').style.display='none';
-    document.getElementById('loginForm').style.display='block';
-    document.getElementById('registerMessage').innerText='';
-}
-
-async function registerCompany(){
-    const name=document.getElementById('registerName').value.trim();
-    const email=document.getElementById('registerEmail').value.trim();
-    const password=document.getElementById('registerPass').value;
-    const message=document.getElementById('registerMessage');
-
-    if(!name||!email||!password){
-        message.innerText='Please fill in all fields.';
-        return;
-    }
-    const policyError = window.saasPasswordError(password);
-    if(policyError){
-        message.innerText = policyError;
-        document.getElementById('registerPass').focus();
-        return;
-    }
-
-    message.innerText='Creating company account...';
-    try{
-        const response=await fetch('/api/company/register',{
-            method:'POST',
-            credentials:'same-origin',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({name,email,password})
-        });
-        const result=await response.json();
-
-        if(response.ok && result.company_id){
-            document.getElementById('loginEmail').value=email;
-            document.getElementById('loginPass').value=password;
-            message.innerText='Company registered! Logging you in...';
-            await doLogin();
-        }else{
-            message.innerText=result.error==='exists'
-                ?'Registration failed. This email may already be registered.'
-                :(result.error||'Registration failed. Please try again.');
-        }
-    }catch(error){
-        message.innerText='Could not connect to the server. Please try again.';
-    }
-}
-
-function showDashboard(company){
-    CID=company.company_id;
-    localStorage.setItem('cid',CID);
-    document.getElementById('compId').innerText=CID;
-    loginScreen.style.display='none';
-    loadStats();
-    loadStaff();
-    loadSettings();
-}
-
-function showLogin(){
-    CID='';
-    localStorage.removeItem('cid');
-    document.getElementById('compId').innerText='Not logged in';
-    loginScreen.style.display='flex';
-}
-
-async function checkSession(){
-    try{
-        const r=await fetch('/api/session',{credentials:'same-origin'});
-        if(!r.ok){
-            showLogin();
-            return;
-        }
-        const company=await r.json();
-        if(company.authenticated && company.company_id){
-            showDashboard(company);
-        }else{
-            showLogin();
-        }
-    }catch(error){
-        showLogin();
-    }
-}
-
-async function doLogin(){
-    const email=document.getElementById('loginEmail').value.trim();
-    const password=document.getElementById('loginPass').value;
-
-    if(!email||!password){
-        alert('Enter your email and password.');
-        return;
-    }
-
-    try{
-        const r=await fetch('/api/company/login',{
-            method:'POST',
-            credentials:'same-origin',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({email:email,password:password})
-        });
-        const j=await r.json();
-
-        if(r.ok && j.company_id){
-            showDashboard({company_id:j.company_id,name:j.name});
-        }else{
-            alert(j.error||'Login failed. Check your details.');
-        }
-    }catch(error){
-        alert('Cannot connect. Please try again when the server is available.');
-    }
-}
-
-async function doLogout(){
-    if(!confirm('Logout?'))return;
-
-    try{
-        await fetch('/api/logout',{
-            method:'POST',
-            credentials:'same-origin'
-        });
-    }finally{
-        localStorage.removeItem('cid');
-        showLogin();
-        location.reload();
-    }
-}
-
-checkSession();
-
-function navTo(t,el){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+t).classList.add('active');if(el){document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));el.classList.add('active');}if(t=='home')loadStats();if(t=='staff'){loadOrgOptions();loadStaff();}if(t=='time')loadTimePage();if(t=='pay'){loadSettings();loadMySubs();}if(t=='settings'){loadSettings();loadAllSubs();}}
-async function loadStats(){let r=await fetch('/api/stats/'+CID);let d=await r.json();document.getElementById('stStaff').innerText=d.staff;document.getElementById('stPresent').innerText=d.present;}
-function staffEscape(value){
- return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-async function loadOrgOptions(){
- const message=document.getElementById('staffFormMessage');
- try{
-  const [dr,br]=await Promise.all([fetch('/api/departments'),fetch('/api/branches')]);
-  const departments=await dr.json();
-  const branches=await br.json();
-  if(!dr.ok||!br.ok)throw new Error(departments.error||branches.error||'Could not load departments and branches.');
-  const deptSelect=document.getElementById('sdept');
-  const branchSelect=document.getElementById('sbranch');
-  const oldDept=deptSelect.value,oldBranch=branchSelect.value;
-  const activeDepartments=departments.filter(d=>d.active);
-  const activeBranches=branches.filter(b=>b.active);
-  deptSelect.innerHTML='<option value="">Select a department</option>'+activeDepartments.map(d=>`<option value="${staffEscape(d.id)}">${staffEscape(d.name)}</option>`).join('');
-  branchSelect.innerHTML='<option value="">No branch assigned</option>'+activeBranches.map(b=>`<option value="${staffEscape(b.id)}">${staffEscape(b.name)}</option>`).join('');
-  if(activeDepartments.some(d=>d.id===oldDept))deptSelect.value=oldDept;
-  if(activeBranches.some(b=>b.id===oldBranch))branchSelect.value=oldBranch;
-  document.getElementById('departmentList').innerHTML=departments.map(d=>`<div class="list-item"><span>${staffEscape(d.name)}</span><span>${d.active?'Active':'Inactive'}</span></div>`).join('')||'<p>No departments yet.</p>';
-  document.getElementById('branchList').innerHTML=branches.map(b=>`<div class="list-item"><div><b>${staffEscape(b.name)}</b><br><small>${staffEscape(b.address||'No address added')}</small></div><span>${b.active?'Active':'Inactive'}</span></div>`).join('')||'<p>No branches yet.</p>';
-  if(message)message.textContent=activeDepartments.length?'':'Create a department below before adding an employee.';
- }catch(error){if(message)message.textContent=error.message;else console.error(error);}
-}
-async function createDepartment(){
- const input=document.getElementById('newDepartmentName');
- const name=input.value.trim();
- if(!name)return alert('Enter a department name.');
- try{
-  const r=await fetch('/api/departments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-  const d=await r.json();
-  if(!r.ok)return alert(d.error||'Could not create department.');
-  input.value='';
-  await loadOrgOptions();
-  document.getElementById('sdept').value=d.id;
-  alert('Department created.');
- }catch(error){alert('Could not create department. Check your connection.');}
-}
-async function createBranch(){
- const name=document.getElementById('newBranchName').value.trim();
- const address=document.getElementById('newBranchAddress').value.trim();
- if(!name)return alert('Enter a branch or factory name.');
- try{
-  const r=await fetch('/api/branches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,address})});
-  const d=await r.json();
-  if(!r.ok)return alert(d.error||'Could not create branch.');
-  document.getElementById('newBranchName').value='';
-  document.getElementById('newBranchAddress').value='';
-  await loadOrgOptions();
-  document.getElementById('sbranch').value=d.id;
-  alert('Branch created.');
- }catch(error){alert('Could not create branch. Check your connection.');}
-}
-async function addStaff(){
- const body={
-  company_id:CID,
-  name:document.getElementById('sname').value.trim(),
-  email:document.getElementById('semail').value.trim(),
-  role:document.getElementById('srole').value,
-  department_id:document.getElementById('sdept').value,
-  branch_id:document.getElementById('sbranch').value,
-  job_title:document.getElementById('sjobtitle').value.trim(),
-  password:document.getElementById('spass').value
- };
- const message=document.getElementById('staffFormMessage');
- if(!body.name||!body.email){message.textContent='Name and email are required.';return;}
- if(!body.department_id){message.textContent='Create and select a department first.';return;}
- const policyError=window.saasPasswordError(body.password);
- if(policyError){
-  message.textContent=policyError;
-  document.getElementById('spass').focus();
-  return;
- }
- try{
-  const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const d=await r.json();
-  if(!r.ok){message.textContent=d.error||'Could not add employee.';return;}
-  message.textContent='Employee added. Share the password securely.';
-  document.getElementById('spass').value='';
-  document.getElementById('sname').value='';
-  document.getElementById('semail').value='';
-  document.getElementById('sjobtitle').value='';
-  await loadStaff();
-  await loadStats();
- }catch(error){message.textContent='Could not add employee. Check your connection.';}
-}
-async function loadStaff(){
- const r=await fetch('/api/staff/'+encodeURIComponent(CID));
- const staff=await r.json();
- if(!r.ok){document.getElementById('staffList').textContent=staff.error||'Could not load employees.';return;}
- let html='';
- for(const u of staff){
-  let status={status:'unknown'};
-  try{status=await (await fetch('/api/attendance/status/'+encodeURIComponent(u.id))).json();}catch(e){}
-  const btn=status.status==='not_in'?`<button class="btn btn-black btn-sm" onclick="doClockIn('${staffEscape(u.id)}')">In</button>`:status.status==='in'?`<button class="btn btn-ghost btn-sm" onclick="doClockOut('${staffEscape(u.id)}')">Out ${Math.round(status.distance||0)}m</button>`:status.status==='done'?`Done ${Math.round(status.distance||0)}m ✓`:'';
-  const details=[u.job_title,u.department,u.branch_name].filter(Boolean).map(staffEscape).join(' · ');
-  html+=`<div class="list-item"><div style="display:flex;gap:8px;align-items:center"><div class="avatar">${staffEscape((u.name||'?').charAt(0).toUpperCase())}</div><div><b>${staffEscape(u.name)}</b><br><small>${staffEscape(u.email||'')}<br>${details||'No assignment details'} · ${staffEscape(u.role)} · ${u.active?'Active':'Inactive'}</small></div></div>${btn}</div>`;
- }
- document.getElementById('staffList').innerHTML=html||'No employees yet.';
- document.getElementById('liveList').innerHTML=html;
-}
-async function loadTimePage(){let r=await fetch('/api/staff/'+CID);let staff=await r.json();let board='';for(let u of staff){let st=await (await fetch('/api/attendance/status/'+u.id)).json();let btn=st.status=='not_in'?`<button class="btn btn-black btn-sm" onclick="doClockIn('${u.id}')">IN</button>`:st.status=='in'?`<button class="btn btn-ghost btn-sm" onclick="doClockOut('${u.id}')">OUT</button>`:`✓`;board+=`<div class="list-item"><b>${u.name}</b> ${btn}</div>`;}document.getElementById('clockBoard').innerHTML=board;loadAtt();}
-async function doClockIn(uid){navigator.geolocation.getCurrentPosition(async pos=>{let r=await fetch('/api/attendance/clock-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:CID,user_id:uid,lat:pos.coords.latitude,lng:pos.coords.longitude,photo_hash:btoa(uid+Date.now()).slice(0,40)})});let j=await r.json();alert(j.msg);loadStaff();loadTimePage();loadStats();},()=>alert('Enable GPS'),{enableHighAccuracy:true});}
-async function doClockOut(uid){let r=await fetch('/api/attendance/clock-out',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:CID,user_id:uid})});let j=await r.json();alert(j.msg);loadStaff();loadTimePage();loadStats();}
-async function loadAtt(){let r=await fetch('/api/attendance/'+CID);let d=await r.json();document.getElementById('attList').innerHTML=d.map(a=>`<div class="list-item"><b>${a.name}</b> ${a.date} ${Math.round(a.distance||0)}m</div>`).join('')||'None';}
-async function loadSettings(){let r=await fetch('/api/settings');let d=await r.json();mpAccount.innerText=d.moniepoint_account||'-';mpName.innerText=d.moniepoint_name||'-';setAccount.value=d.moniepoint_account||'';setName.value=d.moniepoint_name||'';setLat.value=d.office_lat||6.5244;setLng.value=d.office_lng||3.3792;setRadius.value=d.office_radius||50;officeStatus.innerText=`Fence ${d.office_radius}m`;}
-async function useMyLocation(){navigator.geolocation.getCurrentPosition(p=>{setLat.value=p.coords.latitude;setLng.value=p.coords.longitude;});}
-async function saveOffice(){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({office_lat:parseFloat(setLat.value),office_lng:parseFloat(setLng.value),office_radius:parseFloat(setRadius.value)})});alert('Saved');loadSettings();}
-async function saveSettings(){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account:setAccount.value,name:setName.value})});alert('Saved');}
-function openPay(p,a){curPlan=p;curAmount=a;mpAmount.innerText='₦'+a;payBox.style.display='block';}
-async function submitProof(){await fetch('/api/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:CID,plan:curPlan,amount:curAmount,proof:proof.value})});alert('Submitted');loadMySubs();}
-async function loadMySubs(){let r=await fetch('/api/subscriptions/'+CID);let d=await r.json();mySubs.innerHTML=d.map(s=>`<div>${s.plan} ${s.status}</div>`).join('')||'None';}
-async function loadAllSubs(){let r=await fetch('/api/subscriptions/all');let d=await r.json();allSubs.innerHTML=d.map(s=>`<div class="list-item"><b>${s.company_id}</b> <button class="btn btn-black btn-sm" onclick="approveSub('${s.id}')">Approve</button></div>`).join('')||'None';}
-async function approveSub(id){await fetch('/api/subscriptions/approve/'+id,{method:'POST'});alert('Approved');loadAllSubs();}
-</script></body></html>
-    """)
+    return render_template('home.html')
 
 
 
@@ -1922,209 +1665,12 @@ self.addEventListener('fetch', event => {
 
 @app.route('/owner-login')
 def owner_login_page():
-    return render_template_string("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SaaS-HR Platform Owner</title>
-<style>
-*{box-sizing:border-box;font-family:Arial,sans-serif}
-body{margin:0;background:#f1f5f9;min-height:100vh;display:grid;place-items:center;padding:20px}
-.card{background:white;padding:28px;border-radius:16px;width:100%;max-width:420px;box-shadow:0 8px 30px #0001}
-h1{font-size:25px;margin-bottom:8px}p{color:#64748b}
-input,button{width:100%;padding:14px;margin-top:14px;border-radius:9px;font-size:16px}
-input{border:1px solid #cbd5e1}
-button{background:#111827;color:white;border:0;cursor:pointer}
-#message{overflow-wrap:anywhere;color:#b91c1c}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>SaaS-HR Owner</h1>
-<p>Sign in to manage your SaaS-HR platform.</p>
-<form id="loginForm">
-<input id="email" type="email" autocomplete="username" placeholder="Owner email" required>
-<input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
-<button id="submit" type="submit">Sign in</button>
-</form>
-<p style="text-align:right;margin:8px 0"><a href="/forgot-password">Forgot password?</a></p>
-<p id="message" role="status" aria-live="polite"></p>
-</div>
-<script>
-document.getElementById('loginForm').addEventListener('submit',async e=>{
- e.preventDefault();
- const button=document.getElementById('submit');
- const message=document.getElementById('message');
- button.disabled=true;
- message.textContent='Signing in...';
- try{
-  const r=await fetch('/api/owner/login',{
-   method:'POST',
-   headers:{'Content-Type':'application/json'},
-   credentials:'same-origin',
-   body:JSON.stringify({
-    email:document.getElementById('email').value.trim(),
-    password:document.getElementById('password').value
-   })
-  });
-  const d=await r.json();
-  if(!r.ok) throw new Error(d.error||'Owner login failed.');
-  location.href='/owner-dashboard';
- }catch(err){
-  message.textContent=err.message||'Unable to sign in. Check your connection.';
- }finally{
-  button.disabled=false;
- }
-});
-</script>
-<script>
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
-      .catch(error => console.error('Service worker registration failed:', error));
-  });
-}
-</script>
-</body>
-</html>
-""")
+    return render_template('owner_login.html')
 
 
 @app.route('/owner-dashboard')
 def owner_dashboard_page():
-    return render_template_string("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SaaS-HR Platform Dashboard</title>
-<style>
-*{box-sizing:border-box;font-family:Arial,sans-serif}
-body{margin:0;background:#f1f5f9;color:#0f172a}
-header{background:#111827;color:white;padding:18px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-header h1{font-size:21px;margin:0}
-button{border:0;border-radius:8px;padding:10px 14px;cursor:pointer;background:#111827;color:white}
-header button{background:white;color:#111827}
-main{max-width:1100px;margin:25px auto;padding:0 16px}
-section{background:white;border-radius:13px;padding:18px;margin-bottom:22px;overflow-x:auto}
-h2{margin-top:0;font-size:20px}
-table{width:100%;border-collapse:collapse;min-width:570px}
-th,td{text-align:left;padding:12px;border-bottom:1px solid #e2e8f0;font-size:14px}
-th{background:#f8fafc}
-.status{display:inline-block;padding:5px 9px;border-radius:20px;background:#e2e8f0}
-#message{color:#b91c1c}
-@media(max-width:600px){main{margin:14px auto}section{padding:12px}th,td{padding:9px}}
-</style>
-</head>
-<body>
-<header>
-<h1>SaaS-HR Platform Owner</h1>
-<div><span id="ownerEmail"></span> <button id="logout">Log out</button></div>
-</header>
-<main>
-<p id="message" role="status" aria-live="polite">Checking owner session...</p>
-<section>
-<h2>Registered Companies</h2>
-<div id="companies">Loading companies...</div>
-</section>
-<section>
-<h2>Subscriptions</h2>
-<div id="subscriptions">Loading subscriptions...</div>
-</section>
-</main>
-<script>
-const message=document.getElementById('message');
-function cell(value){
- const td=document.createElement('td');
- td.textContent=value==null?'':String(value);
- return td;
-}
-function table(headers,rows){
- const t=document.createElement('table');
- const thead=document.createElement('thead');
- const hr=document.createElement('tr');
- headers.forEach(h=>{const th=document.createElement('th');th.textContent=h;hr.appendChild(th)});
- thead.appendChild(hr);t.appendChild(thead);
- const body=document.createElement('tbody');
- rows.forEach(row=>body.appendChild(row));
- t.appendChild(body);return t;
-}
-async function api(url,options={}){
- const r=await fetch(url,{credentials:'same-origin',...options});
- const d=await r.json();
- if(r.status===401){location.href='/owner-login';throw new Error('Owner session expired. Please sign in again.')}
- if(!r.ok)throw new Error(d.error||'Request failed.');
- return d;
-}
-async function loadCompanies(){
- const data=await api('/api/owner/companies');
- const rows=data.map(c=>{
-  const tr=document.createElement('tr');
-  [c.name,c.email,c.plan,c.created].forEach(v=>tr.appendChild(cell(v)));
-  return tr;
- });
- const box=document.getElementById('companies');
- box.replaceChildren();
- if(!rows.length){box.textContent='No companies registered yet.';return}
- box.appendChild(table(['Company','Email','Plan','Created'],rows));
-}
-async function loadSubscriptions(){
- const data=await api('/api/owner/subscriptions');
- const rows=data.map(s=>{
-  const tr=document.createElement('tr');
-  [s.company_name||s.company_id,s.plan,'₦'+Number(s.amount||0).toLocaleString(),s.status,s.created].forEach(v=>tr.appendChild(cell(v)));
-  const action=document.createElement('td');
-  if(String(s.status).toLowerCase()!=='approved' && String(s.status).toLowerCase()!=='active'){
-   const button=document.createElement('button');
-   button.textContent='Approve';
-   button.addEventListener('click',async()=>{
-    if(!confirm('Approve this subscription?'))return;
-    button.disabled=true;
-    try{
-     await api('/api/owner/subscriptions/approve/'+encodeURIComponent(s.id),{method:'POST'});
-     await loadSubscriptions();
-     message.textContent='Subscription approved.';
-    }catch(e){message.textContent=e.message;button.disabled=false}
-   });
-   action.appendChild(button);
-  }else{
-   action.textContent='—';
-  }
-  tr.appendChild(action);return tr;
- });
- const box=document.getElementById('subscriptions');
- box.replaceChildren();
- if(!rows.length){box.textContent='No subscriptions found.';return}
- box.appendChild(table(['Company','Plan','Amount','Status','Created','Action'],rows));
-}
-async function start(){
- try{
-  const d=await api('/api/owner/session');
-  document.getElementById('ownerEmail').textContent=d.email||'Owner';
-  await Promise.all([loadCompanies(),loadSubscriptions()]);
-  message.textContent='';
- }catch(e){message.textContent=e.message}
-}
-document.getElementById('logout').addEventListener('click',async()=>{
- try{await fetch('/api/owner/logout',{method:'POST',credentials:'same-origin'})}
- finally{location.href='/owner-login'}
-});
-start();
-</script>
-<script>
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
-      .catch(error => console.error('Service worker registration failed:', error));
-  });
-}
-</script>
-</body>
-</html>
-""")
+    return render_template('owner_dashboard.html')
 
 @app.route('/api/owner/login', methods=['POST'])
 def owner_login():
@@ -2171,12 +1717,197 @@ def owner_logout():
     session.clear()
     return jsonify({"message": "Logged out"})
 
+
+@app.route('/api/company/lifecycle')
+def company_lifecycle_status():
+    cid = session.get("company_id")
+    if not cid:
+        return jsonify({"error": "Authentication required"}), 401
+    row = get_db().execute(
+        """SELECT status, reason, updated_by, updated_at
+           FROM company_lifecycle WHERE company_id=?""",
+        (cid,)
+    ).fetchone()
+    if not row:
+        return jsonify({
+            "company_id": cid,
+            "status": "active",
+            "reason": "",
+            "updated_at": None
+        })
+    return jsonify({"company_id": cid, **dict(row)})
+
+
+@app.route('/api/staff/<cid>/<user_id>/status', methods=['PATCH'])
+def set_employee_lifecycle_status(cid, user_id):
+    company_id = session.get("company_id")
+    if not company_id:
+        return jsonify({"error": "Authentication required"}), 401
+    if str(cid) != str(company_id):
+        return jsonify({"error": "Access denied"}), 403
+
+    data = request.get_json(silent=True) or {}
+    status = str(data.get("status", "")).strip().lower()
+    reason = str(data.get("reason", "")).strip()
+    allowed = {"active", "on_leave", "inactive", "suspended", "former_employee"}
+
+    if status not in allowed:
+        return jsonify({"error": "Unsupported employee status"}), 400
+    if not reason or len(reason) > 500:
+        return jsonify({"error": "A reason of 1-500 characters is required"}), 400
+
+    db = get_db()
+    employee = db.execute(
+        """SELECT id, active, employment_status FROM users
+           WHERE id=? AND company_id=?""",
+        (user_id, company_id)
+    ).fetchone()
+    if not employee:
+        return jsonify({"error": "Employee not found"}), 404
+
+    old_status = employee["employment_status"] or (
+        "active" if employee["active"] else "inactive"
+    )
+    active = 1 if status in ("active", "on_leave") else 0
+
+    if old_status != status:
+        db.execute(
+            """UPDATE users SET employment_status=?, active=?
+               WHERE id=? AND company_id=?""",
+            (status, active, user_id, company_id)
+        )
+        db.execute(
+            """INSERT INTO lifecycle_status_history
+               (id, company_id, subject_type, subject_id, old_status,
+                new_status, reason, changed_by, created_at)
+               VALUES (?, ?, 'employee', ?, ?, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex, company_id, user_id, old_status,
+                status, reason, company_id, datetime.now().isoformat()
+            )
+        )
+        db.commit()
+
+    return jsonify({
+        "id": user_id,
+        "employment_status": status,
+        "active": bool(active)
+    })
+
+
+@app.route('/api/staff/<cid>/<user_id>/status-history')
+def employee_lifecycle_history(cid, user_id):
+    company_id = session.get("company_id")
+    if not company_id:
+        return jsonify({"error": "Authentication required"}), 401
+    if str(cid) != str(company_id):
+        return jsonify({"error": "Access denied"}), 403
+
+    db = get_db()
+    employee = db.execute(
+        "SELECT id FROM users WHERE id=? AND company_id=?",
+        (user_id, company_id)
+    ).fetchone()
+    if not employee:
+        return jsonify({"error": "Employee not found"}), 404
+
+    rows = db.execute(
+        """SELECT old_status, new_status, reason, changed_by, created_at
+           FROM lifecycle_status_history
+           WHERE company_id=? AND subject_type='employee' AND subject_id=?
+           ORDER BY created_at DESC""",
+        (company_id, user_id)
+    ).fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
 @app.route('/api/owner/companies')
 def owner_companies():
     rows = get_db().execute(
-        "SELECT id, name, email, plan, created FROM companies ORDER BY created DESC"
+        """SELECT c.id, c.name, c.email, c.plan, c.created,
+                  COALESCE(l.status, 'active') AS operational_status
+           FROM companies c
+           LEFT JOIN company_lifecycle l ON l.company_id=c.id
+           ORDER BY c.created DESC"""
     ).fetchall()
     return jsonify([dict(row) for row in rows])
+
+
+@app.route('/api/owner/companies/<cid>/status', methods=['PATCH'])
+def owner_set_company_lifecycle_status(cid):
+    status_data = request.get_json(silent=True) or {}
+    status = str(status_data.get("status", "")).strip().lower()
+    reason = str(status_data.get("reason", "")).strip()
+    allowed = {"active", "paused", "suspended", "closed"}
+
+    if status not in allowed:
+        return jsonify({"error": "Unsupported company status"}), 400
+    if not reason or len(reason) > 500:
+        return jsonify({"error": "A reason of 1-500 characters is required"}), 400
+
+    db = get_db()
+    company = db.execute("SELECT id FROM companies WHERE id=?", (cid,)).fetchone()
+    if not company:
+        return jsonify({"error": "Company not found"}), 404
+
+    current = db.execute(
+        "SELECT status FROM company_lifecycle WHERE company_id=?",
+        (cid,)
+    ).fetchone()
+    old_status = current["status"] if current else "active"
+    now = datetime.now().isoformat()
+    owner_id = str(session.get("platform_admin_id"))
+
+    if current:
+        db.execute(
+            """UPDATE company_lifecycle
+               SET status=?, reason=?, updated_by=?, updated_at=?
+               WHERE company_id=?""",
+            (status, reason, owner_id, now, cid)
+        )
+    else:
+        db.execute(
+            """INSERT INTO company_lifecycle
+               (company_id, status, reason, updated_by, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (cid, status, reason, owner_id, now)
+        )
+
+    if old_status != status:
+        db.execute(
+            """INSERT INTO lifecycle_status_history
+               (id, company_id, subject_type, subject_id, old_status,
+                new_status, reason, changed_by, created_at)
+               VALUES (?, ?, 'company', ?, ?, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex, cid, cid, old_status, status,
+                reason, owner_id, now
+            )
+        )
+    db.commit()
+    return jsonify({
+        "company_id": cid,
+        "operational_status": status,
+        "message": "Company status updated"
+    })
+
+
+@app.route('/api/owner/companies/<cid>/status-history')
+def owner_company_lifecycle_history(cid):
+    db = get_db()
+    company = db.execute("SELECT id FROM companies WHERE id=?", (cid,)).fetchone()
+    if not company:
+        return jsonify({"error": "Company not found"}), 404
+
+    rows = db.execute(
+        """SELECT old_status, new_status, reason, changed_by, created_at
+           FROM lifecycle_status_history
+           WHERE company_id=? AND subject_type='company' AND subject_id=?
+           ORDER BY created_at DESC""",
+        (cid, cid)
+    ).fetchall()
+    return jsonify([dict(row) for row in rows])
+
 
 @app.route('/api/owner/subscriptions')
 def owner_subscriptions():
@@ -2521,147 +2252,13 @@ def password_recovery_reset():
 
 @app.route('/forgot-password')
 def forgot_password_page():
-    return render_template_string("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Forgot Password | SaaS-HR</title>
-<style>
-*{box-sizing:border-box;font-family:Arial,sans-serif}
-body{margin:0;background:#f5f6f8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:white;padding:25px;border-radius:18px;width:100%;max-width:400px}
-input,button{width:100%;padding:14px;border-radius:10px;margin-top:12px}
-input{border:1px solid #ddd}
-button{background:#000;color:white;border:0;font-weight:bold}
-a{color:#333}#message{overflow-wrap:anywhere}
-</style>
-</head>
-<body>
-<div class="card">
-<h2>SaaS-HR</h2>
-<h3>Forgot your password?</h3>
-<p>Enter your account email. If an account matches, reset instructions will be sent.</p>
-<form id="forgotForm">
-<input id="email" type="email" autocomplete="email" placeholder="Account email" required>
-<button type="submit">Send Reset Link</button>
-</form>
-<p id="message" role="status" aria-live="polite"></p>
-<p><a href="/">Back to login</a></p>
-</div>
-<script>
-document.getElementById('forgotForm').addEventListener('submit',async function(event){
-    event.preventDefault();
-    const message=document.getElementById('message');
-    const button=this.querySelector('button');
-    button.disabled=true;
-    message.textContent='Sending request...';
-    try{
-        const response=await fetch('/api/password/forgot',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({email:document.getElementById('email').value.trim()})
-        });
-        const data=await response.json();
-        message.textContent=data.message||data.error||'If the account exists, reset instructions will be sent.';
-    }catch(error){
-        message.textContent='Unable to send the request. Check your connection and try again.';
-    }finally{
-        button.disabled=false;
-    }
-});
-</script>
-</body>
-</html>
-""")
+    return render_template('forgot_password.html')
 
 
 @app.route('/reset-password')
 def reset_password_page():
     token = request.args.get('token', '')
-    return render_template_string("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reset Password | SaaS-HR</title>
-<style>
-*{box-sizing:border-box;font-family:Arial,sans-serif}
-body{margin:0;background:#f5f6f8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:white;padding:25px;border-radius:18px;width:100%;max-width:400px}
-input,button{width:100%;padding:14px;border-radius:10px;margin-top:12px}
-input{border:1px solid #ddd}
-button{background:#000;color:white;border:0;font-weight:bold}
-a{color:#333}#message{overflow-wrap:anywhere}
-</style>
-</head>
-<body>
-<div class="card">
-<h2>SaaS-HR</h2>
-<h3>Choose a new password</h3>
-<p>Use at least 12 characters.</p>
-<form id="resetForm">
-<input id="password" type="password" autocomplete="new-password" minlength="12" placeholder="New strong password (12+ characters)" required>
-<input id="confirm" type="password" autocomplete="new-password" minlength="12" placeholder="Confirm new password" required>
-<button type="submit">Reset Password</button>
-</form>
-<p id="message" role="status" aria-live="polite"></p>
-<p><a href="/">Back to login</a></p>
-</div>
-<script>
-const token={{ token|tojson }};
-const form=document.getElementById('resetForm');
-const message=document.getElementById('message');
-if(!token){
-    message.textContent='Reset token missing. Please request a new link.';
-    form.querySelector('button').disabled=true;
-}
-form.addEventListener('submit',async function(event){
-    event.preventDefault();
-    const password=document.getElementById('password').value;
-    const confirm=document.getElementById('confirm').value;
-    const policyError = window.saasPasswordError(password);
-    if(policyError){
-        message.textContent = policyError;
-        document.getElementById('password').focus();
-        return;
-    }
-    if(password!==confirm){
-        message.textContent='The passwords do not match.';
-        document.getElementById('confirm').focus();
-        return;
-    }
-    const button=form.querySelector('button');
-    button.disabled=true;
-    message.textContent='Resetting password...';
-    try{
-        const response=await fetch('/api/password/reset',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({token:token,password:password})
-        });
-        const data=await response.json();
-        message.textContent=data.message||data.error||'Unable to reset password.';
-        if(response.ok){
-            form.style.display='none';
-            const link=document.createElement('a');
-            link.href='/';
-            link.textContent='Go to login';
-            message.appendChild(document.createElement('br'));
-            message.appendChild(link);
-        }
-    }catch(error){
-        message.textContent='Connection error. Please try again.';
-    }finally{
-        button.disabled=false;
-    }
-});
-</script>
-</body>
-</html>
-""", token=token)
+    return render_template('reset_password.html', token=token)
 
 
 

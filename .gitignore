@@ -7,6 +7,15 @@ saas_hr.db
 saas_hr.db-journal
 saas_hr.db-wal
 saas_hr.db-shm
-app.py.before_*
+# Local backup snapshots; preserve on-device, exclude from Git
+*.before_*
+*.before-*
 security_audit_report.txt
 test_email.py
+
+# Local development and test artifacts
+.venv/
+venv/
+.coverage
+htmlcov/
+.pytest_cache/

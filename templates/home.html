@@ -1,5 +1,13 @@
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://cdnjs.cloudflare.com/ajax/libs/remixicon/4.2.0/remixicon.min.css" rel="stylesheet">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}"></head><body>
+{% extends "base.html" %}
+
+{% block title %}SaaS-HR | Company Dashboard{% endblock %}
+
+{% block head %}
+<link href="https://cdnjs.cloudflare.com/ajax/libs/remixicon/4.2.0/remixicon.min.css" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+{% endblock %}
+
+{% block content %}
 <div id="loginScreen" class="login">
 <div class="card" style="width:100%;max-width:380px">
 <h2>SaaS-HR</h2>
@@ -59,4 +67,9 @@
 <div id="tab-pay" class="tab"><div class="card"><h4>Plans</h4><button class="btn btn-black" onclick="openPay('pro',5000)">Pay Pro ₦5k</button></div><div class="card" style="display:none" id="payBox"><p>Acct <b id="mpAccount">-</b> Name <b id="mpName">-</b> Amt <b id="mpAmount">-</b></p><input id="proof" placeholder="ref"><button class="btn btn-black" onclick="submitProof()">Submit</button></div><div class="card"><div id="mySubs"></div></div></div>
 <div id="tab-settings" class="tab"><div class="card"><h4>Office GPS 50m</h4><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input id="setLat" type="number" step="0.000001"><input id="setLng" type="number" step="0.000001"></div><input id="setRadius" value="50" type="number"><button class="btn btn-ghost" onclick="useMyLocation()">📍 My Location</button><button class="btn btn-black" style="margin-top:8px" onclick="saveOffice()">Save Office</button><p id="officeStatus"></p></div><div class="card"><h4>Moniepoint</h4><input id="setAccount"><input id="setName"><button class="btn btn-black" onclick="saveSettings()">Save</button></div><div class="card"><h4>Approve</h4><div id="allSubs"></div><button class="btn btn-ghost" onclick="loadAllSubs()">Load</button></div></div></div>
 <div class="bottom-nav"><div class="nav-item active" onclick="navTo('home',this)"><i class="ri-home-5-fill"></i>Home</div><div class="nav-item" onclick="navTo('staff',this)"><i class="ri-team-line"></i>Staff</div><div class="nav-item" onclick="navTo('time',this)"><i class="ri-time-line"></i>Time</div><div class="nav-item" onclick="navTo('pay',this)"><i class="ri-wallet-3-line"></i>Pay</div><div class="nav-item" onclick="navTo('settings',this)"><i class="ri-settings-3-line"></i>You</div></div>
-<script src="{{ url_for('static', filename='js/app.js') }}" defer></script></body></html>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+{% endblock %}

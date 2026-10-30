@@ -19,3 +19,6 @@ venv/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Local migration and recovery backups
+.local_backups/

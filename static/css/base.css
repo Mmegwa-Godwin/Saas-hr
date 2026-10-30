@@ -1,0 +1,55 @@
+.site-content {
+    flex: 1 0 auto;
+}
+
+.site-footer {
+    width: 100%;
+    padding: 22px 16px;
+    background: #111827;
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    text-align: center;
+}
+
+.site-footer strong {
+    font-size: 16px;
+    letter-spacing: 0.5px;
+}
+
+.site-footer span {
+    color: #cbd5e1;
+    font-size: 13px;
+}
+
+.site-footer small {
+    color: #94a3b8;
+    font-size: 11px;
+    margin-top: 4px;
+}
+
+body.auth-layout {
+    min-height: 100vh;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+}
+
+.auth-layout .site-content {
+    display: flex;
+    flex: 1 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 20px;
+}
+
+.auth-layout .site-footer {
+    flex-shrink: 0;
+}

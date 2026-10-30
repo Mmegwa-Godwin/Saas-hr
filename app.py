@@ -463,15 +463,17 @@ def install_browser_csrf_helper(response):
             const eye = document.createElement('button');
             eye.type = 'button';
             eye.className = 'password-eye';
-            eye.textContent = '👁';
+            eye.textContent = '🙈';
             eye.setAttribute('aria-label', 'Show password');
             eye.setAttribute('aria-pressed', 'false');
-            eye.title = 'Show or hide password';
+            eye.title = 'Show password';
             eye.addEventListener('click', function () {
                 const show = input.type === 'password';
                 input.type = show ? 'text' : 'password';
+                eye.textContent = show ? '👁' : '🙈';
                 eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
                 eye.setAttribute('aria-pressed', String(show));
+                eye.title = show ? 'Hide password' : 'Show password';
             });
             wrap.appendChild(eye);
 

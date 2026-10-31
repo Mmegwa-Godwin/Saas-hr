@@ -17,10 +17,18 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from config import AppConfig
 from database import close_db, get_db, init_db
 from services.auth_service import authenticate_company, authenticate_employee, authenticate_owner
+from services.rbac_service import has_permission
+from services.route_permissions import get_employee_route_permission
 
 app = Flask(__name__)
 app.config.from_object(AppConfig)
 app.teardown_appcontext(close_db)
+
+
+def get_json_object() -> dict:
+    """Return request JSON as a dictionary, or an empty dictionary."""
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
 
 IS_PRODUCTION = AppConfig.IS_PRODUCTION
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,7 +200,30 @@ def security_guard():
 
             return None
 
-        return jsonify({"error": "Employee permission denied"}), 403
+        # Resolve the exact employee route and required HR permission.
+        permission = get_employee_route_permission(
+            request.endpoint,
+            request.method,
+        )
+        if permission is None:
+            return jsonify({"error": "Employee permission denied"}), 403
+
+        # Reject URLs that target another company's records.
+        view_args = request.view_args or {}
+        route_cid = view_args.get("cid")
+        if route_cid is not None and str(route_cid) != str(cid):
+            return jsonify({"error": "Access denied"}), 403
+
+        department_key, action = permission
+        if not has_permission(
+            cid,
+            employee_id,
+            department_key,
+            action,
+        ):
+            return jsonify({"error": "Employee permission denied"}), 403
+
+        return None
 
     # Company sessions may manage attendance records, but self-service
     # clock-in/out endpoints are reserved for authenticated employees.
@@ -216,7 +247,7 @@ def security_guard():
         "SELECT status FROM company_lifecycle WHERE company_id=?",
         (cid,)
     ).fetchone()
-    operational_status = lifecycle_row["status"] if lifecycle_row else "active"
+    operational_status = lifecycle_row["status"] if lifecycle_row else "unknown"
     if operational_status != "active" and path != "/api/company/lifecycle":
         return jsonify({
             "error": "Company operations are unavailable",
@@ -576,7 +607,7 @@ def password_policy_error(password):
 
 @app.route('/api/company/register', methods=['POST'])
 def reg():
-    d = request.get_json(silent=True) or {}
+    d = get_json_object()
     name = str(d.get("name", "")).strip()
     email = str(d.get("email", "")).strip().lower()
     password = d.get("password", "")
@@ -591,10 +622,17 @@ def reg():
     cid = uuid.uuid4().hex[:8]
     db = get_db()
     try:
+        now = datetime.now().isoformat()
         db.execute(
             "INSERT INTO companies VALUES (?,?,?,?,?,?)",
             (cid, name, email, generate_password_hash(password),
-             "free", datetime.now().isoformat())
+             "free", now)
+        )
+        db.execute(
+            """INSERT INTO company_lifecycle
+               (company_id, status, reason, updated_by, updated_at)
+               VALUES (?, 'active', 'Company registration', 'system', ?)""",
+            (cid, now)
         )
         db.commit()
         return jsonify({"company_id": cid}), 201
@@ -603,7 +641,7 @@ def reg():
         return jsonify({"error": "Registration failed. This email may already be registered."}), 400
 @app.route('/api/company/login', methods=['POST'])
 def login():
-    d = request.get_json(silent=True) or {}
+    d = get_json_object()
     email = str(d.get('email', '')).strip().lower()
     password = d.get('password', '')
     if not isinstance(password, str):
@@ -908,7 +946,7 @@ def update_company_branch(branch_id):
 
 @app.route('/api/staff', methods=['POST'])
 def add_staff():
-    d = request.get_json(silent=True) or {}
+    d = get_json_object()
     cid = session.get("company_id")
     name = str(d.get("name", "")).strip()
     email = str(d.get("email", "")).strip().lower()
@@ -1071,7 +1109,7 @@ def list_staff(cid):
     return jsonify([dict(r) for r in rows])
 @app.route('/api/attendance/clock-in', methods=['POST'])
 def ci():
-    d = request.get_json(silent=True) or {}
+    d = get_json_object()
     cid = session.get('company_id')
 
     if not cid:
@@ -1166,7 +1204,7 @@ def ci():
 
 @app.route('/api/attendance/clock-out', methods=['POST'])
 def co():
-    d = request.get_json(silent=True) or {}
+    d = get_json_object()
     cid = session.get('company_id')
     uid = d.get('user_id')
 
@@ -1481,7 +1519,7 @@ def settings_route():
         ).fetchone()
 
     if request.method == 'POST':
-        d = request.get_json(silent=True) or {}
+        d = get_json_object()
         account = d.get('account', cur['moniepoint_account'])
         name = d.get('name', cur['moniepoint_name'])
         lat = d.get('office_lat', cur['office_lat'])

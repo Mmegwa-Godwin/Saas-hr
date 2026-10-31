@@ -137,6 +137,15 @@ try:
             "ux_attendance_company_user_date" in indexes
         )
 
+    # Resolve session versions inside a Flask application context.
+    with app_module.app.app_context():
+        company_auth_version = app_module.get_or_create_auth_version(
+            "company", "c1"
+        )
+        employee_auth_version = app_module.get_or_create_auth_version(
+            "employee", "u1"
+        )
+
     # Separate clients keep company and employee sessions independent.
     employee_client = app_module.app.test_client()
     company_client = app_module.app.test_client()
@@ -149,6 +158,7 @@ try:
     with company_client.session_transaction() as session:
         session["company_id"] = "c1"
         session["company_name"] = "Company One"
+        session["auth_version"] = company_auth_version
 
     # ------------------------------------------------------
     # SUITE PRE: TENANT ISOLATION AND CSRF REGRESSIONS
@@ -220,6 +230,7 @@ try:
         session["company_name"] = "Company One"
         session["employee_id"] = "u1"
         session["employee_name"] = "u1"
+        session["auth_version"] = employee_auth_version
 
     mixed_session_response = mixed_session_client.get("/api/staff/c1")
     check(

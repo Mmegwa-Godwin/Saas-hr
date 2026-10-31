@@ -4,6 +4,7 @@ import uuid
 from flask import current_app, g
 
 from config import AppConfig
+from services.accounting_schema import init_accounting_schema
 
 
 def get_db():
@@ -312,7 +313,140 @@ def init_db():
 
     db.commit()
 
+
+    # Company RBAC foundation. Additive migration; existing accounts are preserved.
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS roles (
+            id TEXT PRIMARY KEY,
+            company_id TEXT NOT NULL,
+            role_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created TEXT NOT NULL,
+            UNIQUE(company_id, role_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS permissions (
+            id TEXT PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            department_key TEXT NOT NULL,
+            action TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS role_permissions (
+            role_id TEXT NOT NULL,
+            permission_id TEXT NOT NULL,
+            PRIMARY KEY(role_id, permission_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_departments (
+            company_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            department_id TEXT NOT NULL,
+            created TEXT NOT NULL,
+            PRIMARY KEY(user_id, department_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_permissions (
+            company_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            department_id TEXT NOT NULL,
+            permission_id TEXT NOT NULL,
+            effect TEXT NOT NULL CHECK(effect IN ('grant', 'deny')),
+            granted_by TEXT NOT NULL,
+            created TEXT NOT NULL,
+            PRIMARY KEY(user_id, department_id, permission_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_roles_company
+        ON roles(company_id);
+
+        CREATE INDEX IF NOT EXISTS ix_user_departments_company
+        ON user_departments(company_id, user_id);
+
+        CREATE INDEX IF NOT EXISTS ix_user_permissions_company
+        ON user_permissions(company_id, user_id, department_id);
+        """
+    )
+
+    departments = {
+        "accounting": "Accounting",
+        "stores": "Stores",
+        "procurement": "Procurement",
+        "welfare_canteen": "Welfare/Canteen",
+        "maintenance_repair": "Maintenance/Repair",
+        "marketing": "Marketing",
+        "sales": "Sales",
+        "media": "Media",
+        "hr": "HR",
+    }
+
+    actions = ("view", "create", "update", "approve", "manage")
+
+    companies = db.execute("SELECT id FROM companies").fetchall()
+
+    for company in companies:
+        company_id = company["id"]
+
+        for key, name in departments.items():
+            existing = db.execute(
+                """SELECT id FROM departments
+                   WHERE company_id = ? AND lower(name) = lower(?)""",
+                (company_id, name),
+            ).fetchone()
+
+            if not existing:
+                db.execute(
+                    """INSERT INTO departments
+                       (id, company_id, name, active, created)
+                       VALUES (?, ?, ?, 1, datetime('now'))""",
+                    (uuid.uuid4().hex[:12], company_id, name),
+                )
+
+        for role_key, role_name in (
+            ("admin", "Admin"),
+            ("hr", "HR"),
+            ("manager", "Manager"),
+            ("staff", "Staff"),
+        ):
+            db.execute(
+                """INSERT OR IGNORE INTO roles
+                   (id, company_id, role_key, name, created)
+                   VALUES (?, ?, ?, ?, datetime('now'))""",
+                (uuid.uuid4().hex, company_id, role_key, role_name),
+            )
+
+    for department_key, department_name in departments.items():
+        for action in actions:
+            code = f"{department_key}.{action}"
+            description = f"{action.title()} access for {department_name}"
+
+            db.execute(
+                """INSERT OR IGNORE INTO permissions
+                   (id, code, department_key, action, description)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (uuid.uuid4().hex, code, department_key, action, description),
+            )
+
+    # Migrate existing primary department assignments into the new
+    # multi-department relationship table without deleting old data.
+    db.execute(
+        """INSERT OR IGNORE INTO user_departments
+           (company_id, user_id, department_id, created)
+           SELECT company_id, id, department_id, datetime('now')
+           FROM users
+           WHERE company_id IS NOT NULL
+             AND department_id IS NOT NULL
+             AND department_id <> ''"""
+    )
+
+    db.commit()
+
     row = db.execute("SELECT * FROM settings LIMIT 1").fetchone()
     if not row:
         db.execute("INSERT INTO settings VALUES (?,?,?,?,?,?)", ("1", "", "", 6.5244, 3.3792, 50))
         db.commit()
+
+    # Additive Accounting schema migration.
+    init_accounting_schema(db)

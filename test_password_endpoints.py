@@ -74,6 +74,12 @@ class PasswordEndpointTests(unittest.TestCase):
         # Simulate a valid company session under the auth-version guard.
         with sqlite3.connect(self.db_path) as db:
             db.execute(
+                """INSERT INTO company_lifecycle
+                   (company_id, status, reason, updated_by, updated_at)
+                   VALUES ('test-company', 'active', 'Test setup', 'system',
+                           '2026-10-31T00:00:00')"""
+            )
+            db.execute(
                 """INSERT INTO auth_versions
                    (account_type, account_id, version)
                    VALUES ('company', 'test-company', 1)"""

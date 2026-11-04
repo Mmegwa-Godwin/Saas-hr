@@ -19,6 +19,7 @@ from database import close_db, get_db, init_db
 from services.auth_service import authenticate_company, authenticate_employee, authenticate_owner
 from services.rbac_service import has_permission
 from services.route_permissions import get_employee_route_permission
+from services.accounting_api import register_accounting_routes
 
 app = Flask(__name__)
 app.config.from_object(AppConfig)
@@ -2300,6 +2301,9 @@ def reset_password_page():
     token = request.args.get('token', '')
     return render_template('reset_password.html', token=token)
 
+
+
+register_accounting_routes(app)
 
 
 if __name__ == '__main__':

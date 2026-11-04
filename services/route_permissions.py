@@ -27,6 +27,15 @@ EMPLOYEE_ROUTE_PERMISSIONS = {
     ("correct_attendance", "POST"): ("hr", "update"),
     ("attendance_audit", "GET"): ("hr", "view"),
     ("stats", "GET"): ("hr", "view"),
+
+    # Accounting
+    ("accounting_accounts", "GET"): ("accounting", "view"),
+    ("accounting_account_create", "POST"): ("accounting", "create"),
+    ("accounting_account_update", "PATCH"): ("accounting", "update"),
+    ("accounting_account_deactivate", "POST"): ("accounting", "manage"),
+    ("accounting_periods", "GET"): ("accounting", "view"),
+    ("accounting_period_create", "POST"): ("accounting", "create"),
+    ("accounting_period_close", "POST"): ("accounting", "manage"),
 }
 
 
